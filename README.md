@@ -12,6 +12,7 @@ python convert_md_to_pdf.py --margins "20mm 25mm"
 - Renders PlantUML diagrams as images and embeds them in the PDF
 - Supports custom page breaks for better document structure
 - Uses your existing `mermaid-config.json` for consistent Mermaid diagram styling
+- **Style Profiles**: Choose between print-optimized and screen-optimized styling
 - Saves PDFs in a `pdf/` subdirectory
 - Uses `temp/` subdirectory for intermediate files (with cleanup option)
 - No LaTeX dependencies - uses Playwright (Chromium) for clean HTML-to-PDF conversion
@@ -60,6 +61,12 @@ This will:
 # Specify custom directories
 python convert_md_to_pdf.py --source ./docs --pdf-dir ./output --temp-dir ./working
 
+# Use screen-optimized style profile (30% larger fonts)
+python convert_md_to_pdf.py --profile a4-screen
+
+# Use print-optimized style profile (default)
+python convert_md_to_pdf.py --profile a4-print
+
 # Keep temporary files for debugging
 python convert_md_to_pdf.py --no-cleanup
 
@@ -70,7 +77,7 @@ python convert_md_to_pdf.py --debug
 python convert_md_to_pdf.py --cleanup-db
 
 # Combine options
-python convert_md_to_pdf.py --debug --no-cleanup --margins "20mm 25mm"
+python convert_md_to_pdf.py --debug --no-cleanup --margins "20mm 25mm" --profile a4-screen
 
 # Get help
 python convert_md_to_pdf.py --help
@@ -79,23 +86,26 @@ python convert_md_to_pdf.py --help
 ## How It Works
 
 1. **Verification Check**: For each markdown file, calculates SHA-256 hash and checks against stored state
-2. **Smart Processing**: Only processes files that have changed or are missing from the database
-3. **Diagram Processing**: The script finds all `\`\`\`mermaid` and `\`\`\`plantuml` code blocks in your markdown files
-4. **Diagram Rendering**: 
+2. **Style Profile Check**: Compares current style profile with the one used for the last generation
+3. **Smart Processing**: Only processes files that have changed, are missing, or have a different style profile
+4. **Diagram Processing**: The script finds all `\`\`\`mermaid` and `\`\`\`plantuml` code blocks in your markdown files
+5. **Diagram Rendering**: 
    - Mermaid diagrams are rendered to PNG images using Playwright
    - PlantUML diagrams are rendered to PNG images using the plantuml library
-5. **Content Replacement**: Diagram code blocks are replaced with image references
-6. **PDF Generation**: The processed markdown is converted to PDF using Pandoc + Playwright (Chromium)
-7. **State Update**: Saves markdown and PDF hashes to SQLite database for future verification
-8. **Cleanup**: Temporary files are removed (unless `--no-cleanup` is specified)
+6. **Content Replacement**: Diagram code blocks are replaced with image references
+7. **PDF Generation**: The processed markdown is converted to PDF using Pandoc + Playwright (Chromium) with the selected style profile
+8. **State Update**: Saves markdown hash, PDF hash, and style profile to SQLite database for future verification
+9. **Cleanup**: Temporary files are removed (unless `--no-cleanup` is specified)
 
 ## Verification System
 
 The converter includes a verification system that avoids unnecessary file recreations:
 - **SHA-256 Hashing**: Each markdown file is hashed to detect changes
-- **SQLite Database**: Document state is stored in `document_state.db` 
-- **Smart Skipping**: Unchanged files are skipped entirely (no processing, no diagram rendering)
+- **Style Profile Tracking**: Database tracks which style profile was used for each document
+- **SQLite Database**: Document state is stored in `state/document_state.db` 
+- **Smart Skipping**: Unchanged files with same style profile are skipped entirely (no processing, no diagram rendering)
 - **Automatic Updates**: State is updated after successful PDF generation
+- **Profile Change Detection**: Switching style profiles triggers regeneration of affected documents
 
 ### Database Management
 
@@ -106,6 +116,42 @@ python convert_md_to_pdf.py --cleanup-db
 # Normal run (uses verification to skip unchanged files)
 python convert_md_to_pdf.py
 ```
+
+## Style Profiles
+
+The converter supports different style profiles optimized for different use cases:
+
+### Available Profiles
+
+- **`a4-print`** (default): Standard print-optimized styling
+  - Base font size: 12px
+  - Optimized for physical printing
+  - Standard margins and spacing
+
+- **`a4-screen`**: Screen-optimized styling with larger fonts
+  - Base font size: 15.6px (30% larger)
+  - Optimized for screen reading
+  - Better readability on digital displays
+
+### Usage Examples
+
+```bash
+# Use default print profile
+python convert_md_to_pdf.py
+
+# Use screen-optimized profile
+python convert_md_to_pdf.py --profile a4-screen
+
+# Switch back to print profile (triggers regeneration)
+python convert_md_to_pdf.py --profile a4-print
+```
+
+### Smart Regeneration
+
+The system tracks which style profile was used for each document. When you switch profiles:
+- Documents are automatically regenerated with the new styling
+- Same profile runs skip unchanged files for efficiency
+- Database tracks both content changes and style profile changes
 
 ## Configuration
 
@@ -154,6 +200,11 @@ You can control page breaks in your PDF output using any of these methods:
    - Check your PlantUML syntax
    - Ensure the plantuml library is installed: `pip install plantuml`
    - Check the temp directory for error messages
+
+6. **Style profile not working as expected**
+   - Verify the profile name is correct: `a4-print` or `a4-screen`
+   - Check that the database was updated: `python convert_md_to_pdf.py --cleanup-db` to reset
+   - Use `--debug` to see which profile is being used
 
 ### Debug Mode
 Use `--debug` to enable detailed logging and `--no-cleanup` to keep temporary files for inspection:

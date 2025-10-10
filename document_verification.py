@@ -13,7 +13,7 @@ from typing import Dict, Optional
 class DocumentStateManager:
     """Manages document state using SQLite database to avoid unnecessary file recreation."""
     
-    def __init__(self, db_path: str = "document_state.db"):
+    def __init__(self, db_path: str = "state/document_state.db"):
         """Initialize the document state manager.
         
         Args:
@@ -32,6 +32,7 @@ class DocumentStateManager:
                         filename TEXT PRIMARY KEY,
                         markdown_hash TEXT NOT NULL,
                         pdf_hash TEXT,
+                        style_profile TEXT DEFAULT 'a4-print',
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
@@ -47,13 +48,13 @@ class DocumentStateManager:
             filename: Name of the document file
             
         Returns:
-            Dictionary containing markdown_hash, pdf_hash, and updated_at, or None if not found
+            Dictionary containing markdown_hash, pdf_hash, style_profile, and updated_at, or None if not found
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT markdown_hash, pdf_hash, updated_at 
+                    SELECT markdown_hash, pdf_hash, style_profile, updated_at 
                     FROM document_state 
                     WHERE filename = ?
                 """, (filename,))
@@ -63,39 +64,42 @@ class DocumentStateManager:
                     return {
                         'markdown_hash': result[0],
                         'pdf_hash': result[1],
-                        'updated_at': result[2]
+                        'style_profile': result[2],
+                        'updated_at': result[3]
                     }
                 return None
         except sqlite3.Error as e:
             raise RuntimeError(f"Failed to get document state: {e}")
     
-    def save_document_state(self, filename: str, markdown_hash: str, pdf_hash: Optional[str] = None) -> None:
+    def save_document_state(self, filename: str, markdown_hash: str, pdf_hash: Optional[str] = None, style_profile: str = 'a4-print') -> None:
         """Save document state to database.
         
         Args:
             filename: Name of the document file
             markdown_hash: SHA-256 hash of the markdown file
             pdf_hash: SHA-256 hash of the PDF file (optional)
+            style_profile: Style profile used for generation (default: 'a4-print')
         """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     INSERT OR REPLACE INTO document_state 
-                    (filename, markdown_hash, pdf_hash, updated_at) 
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """, (filename, markdown_hash, pdf_hash))
+                    (filename, markdown_hash, pdf_hash, style_profile, updated_at) 
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """, (filename, markdown_hash, pdf_hash, style_profile))
                 conn.commit()
         except sqlite3.Error as e:
             raise RuntimeError(f"Failed to save document state: {e}")
     
-    def needs_regeneration(self, filename: str, current_markdown_hash: str, pdf_path: Path) -> bool:
-        """Check if PDF needs regeneration based on hash comparison and file existence.
+    def needs_regeneration(self, filename: str, current_markdown_hash: str, pdf_path: Path, current_style_profile: str = 'a4-print') -> bool:
+        """Check if PDF needs regeneration based on hash comparison, file existence, and style profile.
         
         Args:
             filename: Name of the document file
             current_markdown_hash: Current SHA-256 hash of the markdown file
             pdf_path: Path to the expected PDF file
+            current_style_profile: Current style profile being used
             
         Returns:
             True if PDF needs regeneration, False otherwise
@@ -108,6 +112,12 @@ class DocumentStateManager:
         
         if state['markdown_hash'] != current_markdown_hash:
             # Markdown has changed, needs regeneration
+            return True
+        
+        # Check for style profile mismatch - only regenerate if profiles differ
+        stored_profile = state.get('style_profile')
+        if stored_profile != current_style_profile:
+            # Style profile mismatch detected, needs regeneration
             return True
         
         if not state['pdf_hash']:
@@ -160,7 +170,7 @@ class DocumentStateManager:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT filename, markdown_hash, pdf_hash, created_at, updated_at
+                    SELECT filename, markdown_hash, pdf_hash, style_profile, created_at, updated_at
                     FROM document_state
                     ORDER BY updated_at DESC
                 """)
@@ -171,8 +181,9 @@ class DocumentStateManager:
                         'filename': row[0],
                         'markdown_hash': row[1],
                         'pdf_hash': row[2],
-                        'created_at': row[3],
-                        'updated_at': row[4]
+                        'style_profile': row[3],
+                        'created_at': row[4],
+                        'updated_at': row[5]
                     }
                     for row in results
                 ]

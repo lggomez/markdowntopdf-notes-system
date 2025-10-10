@@ -25,13 +25,35 @@ init(autoreset=True)
 class MarkdownToPDFConverter:
     """Markdown to PDF converter using Playwright (Puppeteer approach)."""
     
-    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: str = "document_state.db"):
+    # Style profiles configuration
+    STYLE_PROFILES = {
+        "a4-print": {
+            "name": "A4 Print (Default)",
+            "description": "Standard print-optimized styling with 12px base font",
+            "font_scale": 1.0,
+            "base_font_size": "12px"
+        },
+        "a4-screen": {
+            "name": "A4 Screen (Large)",
+            "description": "Screen-optimized styling with 30% larger fonts for better readability",
+            "font_scale": 1.3,
+            "base_font_size": "15.6px"
+        }
+    }
+    
+    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: str = "state/document_state.db", style_profile: str = "a4-print"):
         """Initialize the converter."""
         self.source_dir = Path(source_dir)
         self.pdf_dir = Path(pdf_dir)
         self.temp_dir = Path(temp_dir)
         self.page_margins = page_margins
         self.debug = debug
+        self.style_profile = style_profile
+        
+        # Validate style profile
+        if style_profile not in self.STYLE_PROFILES:
+            available_profiles = ", ".join(self.STYLE_PROFILES.keys())
+            raise ValueError(f"Invalid style profile '{style_profile}'. Available profiles: {available_profiles}")
         
         # Initialize document state manager
         self.state_manager = DocumentStateManager(db_path)
@@ -39,6 +61,10 @@ class MarkdownToPDFConverter:
         # Create directories
         self.pdf_dir.mkdir(exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
+        
+        # Log style profile information
+        profile_info = self.STYLE_PROFILES[self.style_profile]
+        self._log_info(f"Using style profile: {profile_info['name']} - {profile_info['description']}")
     
     def _log_debug(self, message: str) -> None:
         """Log debug message with color (only if debug mode is enabled)."""
@@ -524,6 +550,11 @@ class MarkdownToPDFConverter:
     def _create_html_template(self, content: str, margins: Dict[str, str], title: str) -> str:
         """Create HTML template with proper styling, margins, and document title."""
         
+        # Get style profile configuration
+        profile = self.STYLE_PROFILES[self.style_profile]
+        font_scale = profile["font_scale"]
+        base_font_size = profile["base_font_size"]
+        
         # Convert margins to cm for CSS
         top_cm = self._convert_margin_to_cm(margins['top'])
         right_cm = self._convert_margin_to_cm(margins['right'])
@@ -551,7 +582,7 @@ class MarkdownToPDFConverter:
             max-width: none;
             margin: 0;
             padding: 0;
-            font-size: 12px;
+            font-size: {base_font_size};
             width: 100%;
             box-sizing: border-box;
         }}
@@ -569,19 +600,19 @@ class MarkdownToPDFConverter:
         }}
         
         h1 {{
-            font-size: 1.6em;
+            font-size: {1.6 * font_scale:.1f}em;
             border-bottom: 2px solid #3498db;
             padding-bottom: 0.2em;
         }}
         
         h2 {{
-            font-size: 1.3em;
+            font-size: {1.3 * font_scale:.1f}em;
             border-bottom: 1px solid #bdc3c7;
             padding-bottom: 0.1em;
         }}
         
         h3 {{
-            font-size: 1.1em;
+            font-size: {1.1 * font_scale:.1f}em;
         }}
         
         p {{
@@ -595,7 +626,7 @@ class MarkdownToPDFConverter:
             border-radius: 3px;
             padding: 0.1em 0.3em;
             font-family: 'Courier New', Consolas, monospace;
-            font-size: 0.8em;
+            font-size: {0.8 * font_scale:.1f}em;
             color: #e83e8c;
         }}
         
@@ -606,7 +637,7 @@ class MarkdownToPDFConverter:
             padding: 0.5em;
             overflow-x: auto;
             margin: 0.5em 0;
-            font-size: 0.8em;
+            font-size: {0.8 * font_scale:.1f}em;
         }}
         
         pre code {{
@@ -628,7 +659,7 @@ class MarkdownToPDFConverter:
             border-collapse: collapse;
             width: 100%;
             margin: 0.5em 0;
-            font-size: 0.9em;
+            font-size: {0.9 * font_scale:.1f}em;
         }}
         
         th, td {{
@@ -867,7 +898,7 @@ class MarkdownToPDFConverter:
                 if success:
                     # Calculate PDF hash and save document state
                     pdf_hash = calculate_file_hash(output_pdf)
-                    self.state_manager.save_document_state(filename, current_markdown_hash, pdf_hash)
+                    self.state_manager.save_document_state(filename, current_markdown_hash, pdf_hash, self.style_profile)
                     self._log_success(f"Converted {md_file.name} to {output_pdf.name}")
                     return True
                 else:
@@ -903,7 +934,7 @@ class MarkdownToPDFConverter:
             filename = md_file.name
             output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
             
-            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf):
+            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
                 self._log_info(f"Skipping {filename} - PDF is up to date")
                 skipped_count += 1
                 continue
@@ -929,6 +960,7 @@ def main():
     parser.add_argument("--pdf-dir", default="pdf", help="PDF output directory (default: pdf)")
     parser.add_argument("--temp-dir", default="temp", help="Temporary files directory (default: temp)")
     parser.add_argument("--margins", default="1in 0.75in", help="Page margins in CSS format (default: '1in 0.75in'). Range: 0-3 inches. Use 1, 2, or 4 values. Units: in, cm, mm, pt, px")
+    parser.add_argument("--profile", default="a4-print", choices=["a4-print", "a4-screen"], help="Style profile for PDF generation (default: 'a4-print'). Available: a4-print (standard), a4-screen (30% larger fonts)")
     parser.add_argument("--no-cleanup", action="store_true", help="Keep temporary files")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for detailed output")
     parser.add_argument("--cleanup-db", action="store_true", help="Clear all document state records from database and exit")
@@ -979,7 +1011,7 @@ def main():
         sys.exit(1)
     
     # Run conversion
-    converter = MarkdownToPDFConverter(args.source, args.pdf_dir, args.temp_dir, args.margins, args.debug)
+    converter = MarkdownToPDFConverter(args.source, args.pdf_dir, args.temp_dir, args.margins, args.debug, style_profile=args.profile)
     converter.convert_all(cleanup=not args.no_cleanup)
 
 
