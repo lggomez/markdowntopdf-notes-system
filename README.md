@@ -66,6 +66,9 @@ python convert_md_to_pdf.py --no-cleanup
 # Enable debug logging for detailed output
 python convert_md_to_pdf.py --debug
 
+# Clear document verification database (forces regeneration of all PDFs)
+python convert_md_to_pdf.py --cleanup-db
+
 # Combine options
 python convert_md_to_pdf.py --debug --no-cleanup --margins "20mm 25mm"
 
@@ -75,13 +78,34 @@ python convert_md_to_pdf.py --help
 
 ## How It Works
 
-1. **Diagram Processing**: The script finds all `\`\`\`mermaid` and `\`\`\`plantuml` code blocks in your markdown files
-2. **Diagram Rendering**: 
+1. **Verification Check**: For each markdown file, calculates SHA-256 hash and checks against stored state
+2. **Smart Processing**: Only processes files that have changed or are missing from the database
+3. **Diagram Processing**: The script finds all `\`\`\`mermaid` and `\`\`\`plantuml` code blocks in your markdown files
+4. **Diagram Rendering**: 
    - Mermaid diagrams are rendered to PNG images using Playwright
    - PlantUML diagrams are rendered to PNG images using the plantuml library
-3. **Content Replacement**: Diagram code blocks are replaced with image references
-4. **PDF Generation**: The processed markdown is converted to PDF using Pandoc + Playwright (Chromium)
-5. **Cleanup**: Temporary files are removed (unless `--no-cleanup` is specified)
+5. **Content Replacement**: Diagram code blocks are replaced with image references
+6. **PDF Generation**: The processed markdown is converted to PDF using Pandoc + Playwright (Chromium)
+7. **State Update**: Saves markdown and PDF hashes to SQLite database for future verification
+8. **Cleanup**: Temporary files are removed (unless `--no-cleanup` is specified)
+
+## Verification System
+
+The converter includes a verification system that avoids unnecessary file recreations:
+- **SHA-256 Hashing**: Each markdown file is hashed to detect changes
+- **SQLite Database**: Document state is stored in `document_state.db` 
+- **Smart Skipping**: Unchanged files are skipped entirely (no processing, no diagram rendering)
+- **Automatic Updates**: State is updated after successful PDF generation
+
+### Database Management
+
+```bash
+# Clear all verification state (forces regeneration of all PDFs)
+python convert_md_to_pdf.py --cleanup-db
+
+# Normal run (uses verification to skip unchanged files)
+python convert_md_to_pdf.py
+```
 
 ## Configuration
 
@@ -151,9 +175,6 @@ Convert `docs/example.md` to PDF:
 ```bash
 python convert_md_to_pdf.py --source ./docs
 ```
-
-### Output
-- `pdf/My Document.pdf` with both diagrams rendered as images
 
 ## License
 

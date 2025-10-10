@@ -16,6 +16,7 @@ import asyncio
 from playwright.async_api import async_playwright
 import plantuml
 from colorama import init, Fore, Back, Style
+from document_verification import DocumentStateManager, calculate_file_hash
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
@@ -24,13 +25,16 @@ init(autoreset=True)
 class MarkdownToPDFConverter:
     """Markdown to PDF converter using Playwright (Puppeteer approach)."""
     
-    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False):
+    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: str = "document_state.db"):
         """Initialize the converter."""
         self.source_dir = Path(source_dir)
         self.pdf_dir = Path(pdf_dir)
         self.temp_dir = Path(temp_dir)
         self.page_margins = page_margins
         self.debug = debug
+        
+        # Initialize document state manager
+        self.state_manager = DocumentStateManager(db_path)
         
         # Create directories
         self.pdf_dir.mkdir(exist_ok=True)
@@ -789,6 +793,12 @@ class MarkdownToPDFConverter:
     def _convert_md_to_pdf(self, md_file: Path, output_pdf: Path) -> bool:
         """Convert markdown file to PDF."""
         try:
+            # Calculate current markdown hash for saving state
+            current_markdown_hash = calculate_file_hash(md_file)
+            filename = md_file.name
+            
+            self._log_info(f"Converting {filename} - markdown has changed or PDF missing")
+            
             # Read markdown content
             with open(md_file, 'r', encoding='utf-8') as f:
                 content = f.read()
@@ -855,6 +865,9 @@ class MarkdownToPDFConverter:
                     self._convert_html_to_pdf(enhanced_html_file, output_pdf, margins)
                 )
                 if success:
+                    # Calculate PDF hash and save document state
+                    pdf_hash = calculate_file_hash(output_pdf)
+                    self.state_manager.save_document_state(filename, current_markdown_hash, pdf_hash)
                     self._log_success(f"Converted {md_file.name} to {output_pdf.name}")
                     return True
                 else:
@@ -879,14 +892,27 @@ class MarkdownToPDFConverter:
         self._log_info(f"Found {len(md_files)} markdown files: {[f.name for f in md_files]}")
         
         success_count = 0
+        skipped_count = 0
+        
         for md_file in md_files:
             if md_file.name == "README.md":
                 continue
+                
+            # Check if conversion is needed before processing
+            current_markdown_hash = calculate_file_hash(md_file)
+            filename = md_file.name
             output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
+            
+            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf):
+                self._log_info(f"Skipping {filename} - PDF is up to date")
+                skipped_count += 1
+                continue
+            
             if self._convert_md_to_pdf(md_file, output_pdf):
                 success_count += 1
         
-        self._log_success(f"Conversion complete: {success_count}/{len(md_files)} files converted successfully")
+        total_processed = success_count + skipped_count
+        self._log_success(f"Conversion complete: {success_count} files converted, {skipped_count} files skipped ({total_processed}/{len(md_files)} total)")
         self._log_info(f"PDF files saved to: {self.pdf_dir.absolute()}")
         
         if cleanup:
@@ -905,38 +931,50 @@ def main():
     parser.add_argument("--margins", default="1in 0.75in", help="Page margins in CSS format (default: '1in 0.75in'). Range: 0-3 inches. Use 1, 2, or 4 values. Units: in, cm, mm, pt, px")
     parser.add_argument("--no-cleanup", action="store_true", help="Keep temporary files")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for detailed output")
+    parser.add_argument("--cleanup-db", action="store_true", help="Clear all document state records from database and exit")
     
     args = parser.parse_args()
+    
+    # Handle database cleanup if requested
+    if args.cleanup_db:
+        try:
+            state_manager = DocumentStateManager()
+            count = state_manager.clear_all_documents()
+            print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Cleared {count} document state records from database")
+            return
+        except Exception as e:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Failed to cleanup database: {e}")
+            sys.exit(1)
     
     # Check dependencies
     try:
         subprocess.run(["pandoc", "--version"], capture_output=True, check=True)
-        print(f"{Fore.GREEN}✓{Style.RESET_ALL} Pandoc is available")
+        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Pandoc is available")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        print(f"{Fore.RED}✗{Style.RESET_ALL} Error: pandoc is required but not found. Please install pandoc.")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: pandoc is required but not found. Please install pandoc.")
         sys.exit(1)
     
     try:
         import playwright
-        print(f"{Fore.GREEN}✓{Style.RESET_ALL} Playwright is available")
+        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Playwright is available")
     except ImportError:
-        print(f"{Fore.RED}✗{Style.RESET_ALL} Error: playwright is required but not found. Please install playwright.")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: playwright is required but not found. Please install playwright.")
         print("Run: pip install playwright && playwright install chromium")
         sys.exit(1)
     
     try:
         import plantuml
-        print(f"{Fore.GREEN}✓{Style.RESET_ALL} PlantUML is available")
+        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} PlantUML is available")
     except ImportError:
-        print(f"{Fore.RED}✗{Style.RESET_ALL} Error: plantuml is required but not found. Please install plantuml.")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: plantuml is required but not found. Please install plantuml.")
         print("Run: pip install plantuml")
         sys.exit(1)
     
     try:
         import colorama
-        print(f"{Fore.GREEN}✓{Style.RESET_ALL} Colorama is available")
+        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Colorama is available")
     except ImportError:
-        print(f"{Fore.RED}✗{Style.RESET_ALL} Error: colorama is required but not found. Please install colorama.")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: colorama is required but not found. Please install colorama.")
         print("Run: pip install colorama")
         sys.exit(1)
     
