@@ -452,6 +452,30 @@ class MarkdownToPDFConverter:
         
         return content
     
+    def _filter_sections_for_print(self, content: str) -> str:
+        """Filter out sections that should be ignored for print profiles."""
+        import re
+        
+        # For print profiles, remove Table of contents sections
+        if self.style_profile == "a4-print":
+            # Pattern to match "## Table of contents" or "### Table of contents" heading and everything until the next heading
+            # This includes the heading itself and all content until the next heading of same or higher level
+            toc_pattern = r'^#{2,3}\s+Table\s+of\s+contents\s*$.*?(?=^#{1,3}\s|\Z)'
+            
+            # Use MULTILINE and DOTALL flags to match across lines
+            filtered_content = re.sub(toc_pattern, '', content, flags=re.MULTILINE | re.DOTALL | re.IGNORECASE)
+            
+            # Clean up any extra whitespace that might be left
+            filtered_content = re.sub(r'\n\s*\n\s*\n', '\n\n', filtered_content)
+            
+            # Log the filtering action
+            if filtered_content != content:
+                self._log_debug("Filtered out 'Table of contents' section for print profile")
+            
+            return filtered_content
+        
+        return content
+    
     def _process_and_embed_images(self, content: str, md_file: Path) -> str:
         """Process and embed referenced images into the temp directory."""
         import re
@@ -659,18 +683,23 @@ class MarkdownToPDFConverter:
             border-collapse: collapse;
             width: 100%;
             margin: 0.5em 0;
-            font-size: {0.9 * font_scale:.1f}em;
+            font-size: {base_font_size} !important;
+            font-family: inherit !important;
         }}
         
         th, td {{
             border: 1px solid #ddd;
             padding: 0.3em;
             text-align: left;
+            font-size: {base_font_size} !important;
+            font-family: inherit !important;
         }}
         
         th {{
             background-color: #f8f9fa;
             font-weight: 600;
+            font-size: {base_font_size} !important;
+            font-family: inherit !important;
         }}
         
         ul, ol {{
@@ -736,6 +765,19 @@ class MarkdownToPDFConverter:
         table {{
             max-width: 100%;
             table-layout: auto;
+        }}
+        
+        /* Force table font inheritance and override any defaults */
+        table, table *, table th, table td, table tr {{
+            font-size: {base_font_size} !important;
+            font-family: inherit !important;
+            line-height: inherit !important;
+        }}
+        
+        /* Additional specificity for markdown-generated tables */
+        body table, body table th, body table td {{
+            font-size: {base_font_size} !important;
+            font-family: inherit !important;
         }}
     </style>
 </head>
@@ -834,8 +876,11 @@ class MarkdownToPDFConverter:
             with open(md_file, 'r', encoding='utf-8') as f:
                 content = f.read()
             
+            # Filter sections based on style profile (e.g., remove TOC for print)
+            processed_content = self._filter_sections_for_print(content)
+            
             # Process Mermaid diagrams
-            processed_content = self._replace_mermaid_with_images(content)
+            processed_content = self._replace_mermaid_with_images(processed_content)
             
             # Process PlantUML diagrams
             processed_content = self._replace_plantuml_with_images(processed_content)

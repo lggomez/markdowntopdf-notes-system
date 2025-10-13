@@ -58,19 +58,14 @@ def process(items):
 
 You can force a new page using any of the supported markers:
 
-```markdown
-<!-- page-break -->
-
-<div class="page-break"></div>
-
-```page-break
-```
-
-<page-break>
-
----
-{.page-break}
-```
+| Method | Syntax | Description |
+|--------|--------|-------------|
+| HTML Comment | `<!-- page-break -->` | Clean, comment-based page break |
+| HTML Div | `<div class="page-break"></div>` | HTML div element with page-break class |
+| Custom Tag | `<page-break>` | Simple custom tag for page breaks |
+| Markdown Div | ````page-break```` | Markdown div syntax |
+| Horizontal Rule | `---` | Standard markdown horizontal rule |
+| CSS Class | `{.page-break}` | CSS class applied to horizontal rule |
 
 Each method is normalized to a printable page break in the final PDF.
 
