@@ -17,6 +17,8 @@ from playwright.async_api import async_playwright
 import plantuml
 from colorama import init, Fore, Back, Style
 from document_verification import DocumentStateManager, calculate_file_hash
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
@@ -41,7 +43,7 @@ class MarkdownToPDFConverter:
         }
     }
     
-    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: str = "state/document_state.db", style_profile: str = "a4-print"):
+    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: str = "state/document_state.db", style_profile: str = "a4-print", max_workers: int = 4):
         """Initialize the converter."""
         self.source_dir = Path(source_dir)
         self.pdf_dir = Path(pdf_dir)
@@ -49,6 +51,8 @@ class MarkdownToPDFConverter:
         self.page_margins = page_margins
         self.debug = debug
         self.style_profile = style_profile
+        self.max_workers = max_workers
+        self._lock = threading.Lock()  # For thread-safe logging
         
         # Validate style profile
         if style_profile not in self.STYLE_PROFILES:
@@ -69,23 +73,28 @@ class MarkdownToPDFConverter:
     def _log_debug(self, message: str) -> None:
         """Log debug message with color (only if debug mode is enabled)."""
         if self.debug:
-            print(f"{Fore.CYAN}[DEBUG]{Style.RESET_ALL} {message}")
+            with self._lock:
+                print(f"{Fore.CYAN}[DEBUG]{Style.RESET_ALL} {message}")
     
     def _log_info(self, message: str) -> None:
         """Log info message with color."""
-        print(f"{Fore.GREEN}[INFO]{Style.RESET_ALL} {message}")
+        with self._lock:
+            print(f"{Fore.GREEN}[INFO]{Style.RESET_ALL} {message}")
     
     def _log_warning(self, message: str) -> None:
         """Log warning message with color."""
-        print(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {message}")
+        with self._lock:
+            print(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {message}")
     
     def _log_error(self, message: str) -> None:
         """Log error message with color."""
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {message}")
+        with self._lock:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {message}")
     
     def _log_success(self, message: str) -> None:
         """Log success message with color."""
-        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} {message}")
+        with self._lock:
+            print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} {message}")
     
     def _validate_margin(self, margin_str: str) -> str:
         """Validate and normalize a single margin value."""
@@ -341,7 +350,7 @@ class MarkdownToPDFConverter:
             self._log_error(f"Failed to render PlantUML diagram: {e}")
             return False
     
-    def _replace_mermaid_with_images(self, content: str) -> str:
+    def _replace_mermaid_with_images(self, content: str, file_id: str = "") -> str:
         """Replace Mermaid code blocks with image references."""
         import re
         
@@ -349,8 +358,8 @@ class MarkdownToPDFConverter:
         mermaid_blocks = re.findall(mermaid_pattern, content, re.DOTALL)
         
         for i, mermaid_code in enumerate(mermaid_blocks):
-            # Create image path
-            image_path = self.temp_dir / f"mermaid_diagram_{i}.png"
+            # Create unique image path using file_id to avoid race conditions
+            image_path = self.temp_dir / f"mermaid_diagram_{file_id}_{i}.png"
             
             # Render Mermaid diagram
             self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}")
@@ -374,7 +383,7 @@ class MarkdownToPDFConverter:
         
         return content
     
-    def _replace_plantuml_with_images(self, content: str) -> str:
+    def _replace_plantuml_with_images(self, content: str, file_id: str = "") -> str:
         """Replace PlantUML code blocks with image references."""
         import re
         
@@ -382,8 +391,8 @@ class MarkdownToPDFConverter:
         plantuml_blocks = re.findall(plantuml_pattern, content, re.DOTALL)
         
         for i, plantuml_code in enumerate(plantuml_blocks):
-            # Create image path
-            image_path = self.temp_dir / f"plantuml_diagram_{i}.png"
+            # Create unique image path using file_id to avoid race conditions
+            image_path = self.temp_dir / f"plantuml_diagram_{file_id}_{i}.png"
             
             # Render PlantUML diagram
             self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}")
@@ -639,6 +648,21 @@ class MarkdownToPDFConverter:
             font-size: {1.1 * font_scale:.1f}em;
         }}
         
+        h4 {{
+            font-size: {1.0 * font_scale:.1f}em;
+            text-decoration: underline;
+        }}
+        
+        h5 {{
+            font-size: {0.9 * font_scale:.1f}em;
+            text-decoration: underline;
+        }}
+        
+        h6 {{
+            font-size: {0.8 * font_scale:.1f}em;
+            text-decoration: underline;
+        }}
+        
         p {{
             margin: 0.5em 0;
             text-align: justify;
@@ -705,10 +729,35 @@ class MarkdownToPDFConverter:
         ul, ol {{
             margin: 0.5em 0;
             padding-left: 1.5em;
+            display: block;
         }}
         
         li {{
             margin: 0.2em 0;
+            display: list-item;
+            list-style-type: disc;
+        }}
+        
+        ul li {{
+            list-style-type: disc;
+        }}
+        
+        ol li {{
+            list-style-type: decimal;
+        }}
+        
+        /* Ensure nested lists work properly */
+        ul ul, ol ol, ul ol, ol ul {{
+            margin: 0.2em 0;
+            padding-left: 1.2em;
+        }}
+        
+        ul ul li {{
+            list-style-type: circle;
+        }}
+        
+        ul ul ul li {{
+            list-style-type: square;
         }}
         
         img {{
@@ -863,6 +912,28 @@ class MarkdownToPDFConverter:
             self._log_error(f"Failed to convert HTML to PDF: {e}")
             return False
     
+    def _convert_single_file(self, md_file: Path) -> tuple[bool, str]:
+        """Convert a single markdown file to PDF. Returns (success, filename)."""
+        try:
+            filename = md_file.name
+            output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
+            
+            # Check if conversion is needed before processing
+            current_markdown_hash = calculate_file_hash(md_file)
+            
+            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
+                self._log_info(f"Skipping {filename} - PDF is up to date")
+                return True, filename  # Success but skipped
+            
+            if self._convert_md_to_pdf(md_file, output_pdf):
+                return True, filename
+            else:
+                return False, filename
+                
+        except Exception as e:
+            self._log_error(f"Error processing {md_file.name}: {e}")
+            return False, md_file.name
+
     def _convert_md_to_pdf(self, md_file: Path, output_pdf: Path) -> bool:
         """Convert markdown file to PDF."""
         try:
@@ -879,11 +950,14 @@ class MarkdownToPDFConverter:
             # Filter sections based on style profile (e.g., remove TOC for print)
             processed_content = self._filter_sections_for_print(content)
             
+            # Create unique file ID for diagram naming to avoid race conditions
+            file_id = md_file.stem  # Use filename without extension
+            
             # Process Mermaid diagrams
-            processed_content = self._replace_mermaid_with_images(processed_content)
+            processed_content = self._replace_mermaid_with_images(processed_content, file_id)
             
             # Process PlantUML diagrams
-            processed_content = self._replace_plantuml_with_images(processed_content)
+            processed_content = self._replace_plantuml_with_images(processed_content, file_id)
             
             # Process page breaks
             processed_content = self._process_page_breaks(processed_content)
@@ -956,7 +1030,7 @@ class MarkdownToPDFConverter:
             self._log_error(f"Error converting {md_file.name}: {e}")
             return False
     
-    def convert_all(self, cleanup: bool = True) -> None:
+    def convert_all(self, cleanup: bool = True, parallel: bool = True) -> None:
         """Convert all markdown files in source directory to PDF."""
         md_files = list(self.source_dir.glob("*.md"))
         
@@ -964,31 +1038,76 @@ class MarkdownToPDFConverter:
             self._log_warning("No markdown files found in source directory.")
             return
         
+        # Filter out README.md
+        md_files = [f for f in md_files if f.name != "README.md"]
+        
         self._log_info("Starting markdown to PDF conversion...")
         self._log_info(f"Found {len(md_files)} markdown files: {[f.name for f in md_files]}")
         
+        if parallel and len(md_files) > 1:
+            self._log_info(f"Using parallel processing with {self.max_workers} workers")
+            self._convert_all_parallel(md_files, cleanup)
+        else:
+            self._log_info("Using sequential processing")
+            self._convert_all_sequential(md_files, cleanup)
+    
+    def _convert_all_parallel(self, md_files: List[Path], cleanup: bool) -> None:
+        """Convert files in parallel using ThreadPoolExecutor."""
+        success_count = 0
+        skipped_count = 0
+        failed_count = 0
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {executor.submit(self._convert_single_file, md_file): md_file for md_file in md_files}
+            
+            # Process completed tasks
+            for future in as_completed(future_to_file):
+                md_file = future_to_file[future]
+                try:
+                    success, filename = future.result()
+                    if success:
+                        # Check if it was actually converted or just skipped
+                        current_markdown_hash = calculate_file_hash(md_file)
+                        output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
+                        
+                        if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
+                            skipped_count += 1
+                        else:
+                            success_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
+                    self._log_error(f"Exception in parallel processing for {md_file.name}: {e}")
+                    failed_count += 1
+        
+        total_processed = success_count + skipped_count + failed_count
+        self._log_success(f"Parallel conversion complete: {success_count} files converted, {skipped_count} files skipped, {failed_count} files failed ({total_processed}/{len(md_files)} total)")
+        self._log_info(f"PDF files saved to: {self.pdf_dir.absolute()}")
+        
+        if cleanup:
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
+            self._log_debug(f"Cleaned up temporary directory: {self.temp_dir}")
+    
+    def _convert_all_sequential(self, md_files: List[Path], cleanup: bool) -> None:
+        """Convert files sequentially (original implementation)."""
         success_count = 0
         skipped_count = 0
         
         for md_file in md_files:
-            if md_file.name == "README.md":
-                continue
+            success, filename = self._convert_single_file(md_file)
+            if success:
+                # Check if it was actually converted or just skipped
+                current_markdown_hash = calculate_file_hash(md_file)
+                output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
                 
-            # Check if conversion is needed before processing
-            current_markdown_hash = calculate_file_hash(md_file)
-            filename = md_file.name
-            output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
-            
-            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
-                self._log_info(f"Skipping {filename} - PDF is up to date")
-                skipped_count += 1
-                continue
-            
-            if self._convert_md_to_pdf(md_file, output_pdf):
-                success_count += 1
+                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
+                    skipped_count += 1
+                else:
+                    success_count += 1
         
         total_processed = success_count + skipped_count
-        self._log_success(f"Conversion complete: {success_count} files converted, {skipped_count} files skipped ({total_processed}/{len(md_files)} total)")
+        self._log_success(f"Sequential conversion complete: {success_count} files converted, {skipped_count} files skipped ({total_processed}/{len(md_files)} total)")
         self._log_info(f"PDF files saved to: {self.pdf_dir.absolute()}")
         
         if cleanup:
@@ -1009,6 +1128,8 @@ def main():
     parser.add_argument("--no-cleanup", action="store_true", help="Keep temporary files")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging for detailed output")
     parser.add_argument("--cleanup-db", action="store_true", help="Clear all document state records from database and exit")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers for PDF conversion (default: 4)")
+    parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing and use sequential conversion")
     
     args = parser.parse_args()
     
@@ -1056,8 +1177,16 @@ def main():
         sys.exit(1)
     
     # Run conversion
-    converter = MarkdownToPDFConverter(args.source, args.pdf_dir, args.temp_dir, args.margins, args.debug, style_profile=args.profile)
-    converter.convert_all(cleanup=not args.no_cleanup)
+    converter = MarkdownToPDFConverter(
+        args.source, 
+        args.pdf_dir, 
+        args.temp_dir, 
+        args.margins, 
+        args.debug, 
+        style_profile=args.profile,
+        max_workers=args.max_workers
+    )
+    converter.convert_all(cleanup=not args.no_cleanup, parallel=not args.no_parallel)
 
 
 if __name__ == "__main__":
