@@ -2,6 +2,8 @@
 """
 Markdown to PDF converter using Puppeteer approach (inspired by vscode-markdown-pdf).
 This uses Playwright (Python equivalent of Puppeteer) for better PDF generation control.
+
+MIT License - Copyright (c) 2025 Markdown to PDF Converter
 """
 
 import os
@@ -11,12 +13,15 @@ import tempfile
 import shutil
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import asyncio
 from playwright.async_api import async_playwright
 import plantuml
 from colorama import init, Fore, Back, Style
-from document_verification import DocumentStateManager, calculate_file_hash
+from PIL import Image, ImageFilter
+from .verification import DocumentStateManager, calculate_file_hash
+from .config import Config
+from .dependencies import check_dependencies
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
@@ -43,32 +48,47 @@ class MarkdownToPDFConverter:
         }
     }
     
-    def __init__(self, source_dir: str, pdf_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: str = "state/document_state.db", style_profile: str = "a4-print", max_workers: int = 4):
-        """Initialize the converter."""
+    def __init__(self, source_dir: str, output_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: Optional[str] = None, style_profile: str = "a4-print", max_workers: int = 4, max_diagram_width = 1680, max_diagram_height = 2240):
+        """Initialize the converter.
+        
+        Args:
+            max_diagram_width: Max width in pixels (int, only resize if rendered exceeds) or percentage of rendered size (str like "80%")
+            max_diagram_height: Max height in pixels (int, only resize if rendered exceeds) or percentage of rendered size (str like "80%")
+        """
         self.source_dir = Path(source_dir)
-        self.pdf_dir = Path(pdf_dir)
+        self.output_dir = Path(output_dir)
         self.temp_dir = Path(temp_dir)
         self.page_margins = page_margins
         self.debug = debug
         self.style_profile = style_profile
         self.max_workers = max_workers
+        self.diagram_width = max_diagram_width
+        self.diagram_height = max_diagram_height
         self._lock = threading.Lock()  # For thread-safe logging
+        
+        # Create format-specific output directory
+        self.pdf_dir = self.output_dir / "pdf"
         
         # Validate style profile
         if style_profile not in self.STYLE_PROFILES:
             available_profiles = ", ".join(self.STYLE_PROFILES.keys())
             raise ValueError(f"Invalid style profile '{style_profile}'. Available profiles: {available_profiles}")
         
-        # Initialize document state manager
+        # Initialize document state manager with configurable db_path
+        if db_path is None:
+            config = Config()
+            db_path = config.get_db_path()
         self.state_manager = DocumentStateManager(db_path)
         
         # Create directories
+        self.output_dir.mkdir(exist_ok=True)
         self.pdf_dir.mkdir(exist_ok=True)
         self.temp_dir.mkdir(exist_ok=True)
         
         # Log style profile information
         profile_info = self.STYLE_PROFILES[self.style_profile]
         self._log_info(f"Using style profile: {profile_info['name']} - {profile_info['description']}")
+        self._log_debug(f"Default diagram dimensions: {self.diagram_width}x{self.diagram_height}px")
     
     def _log_debug(self, message: str) -> None:
         """Log debug message with color (only if debug mode is enabled)."""
@@ -184,15 +204,186 @@ class MarkdownToPDFConverter:
         else:
             return value * 2.54
     
-    async def _render_mermaid_diagram(self, mermaid_code: str, output_path: Path) -> bool:
+    def _get_viewport_dimensions(self) -> tuple[int, int]:
+        """Get viewport dimensions for diagram rendering (always integers).
+        
+        Returns:
+            Tuple of (width, height) in pixels for viewport size
+        """
+        # Default viewport size for rendering
+        default_width = 1680
+        default_height = 2240
+        
+        # If diagram dimensions are integers, use them for viewport
+        # If they're percentages, use defaults (resizing happens after rendering)
+        if isinstance(self.diagram_width, int):
+            width = self.diagram_width
+        else:
+            width = default_width
+            
+        if isinstance(self.diagram_height, int):
+            height = self.diagram_height
+        else:
+            height = default_height
+            
+        return width, height
+    
+    def _parse_dimension_value(self, value, original_size: int) -> Optional[int]:
+        """Parse dimension value that can be max pixels (int) or percentage (str).
+        
+        Args:
+            value: int for max pixels (only resize if original exceeds), 
+                   str like "80%" for percentage of original (always applied, max 100%)
+            original_size: Original dimension in pixels (for percentage calculation)
+            
+        Returns:
+            Target dimension in pixels, or None if no resizing needed
+        """
+        if value is None:
+            return None
+            
+        # If it's already an int (max pixels constraint)
+        if isinstance(value, int):
+            # Only resize if original exceeds the max
+            if original_size > value:
+                return value
+            else:
+                return None  # Keep original size
+            
+        # If it's a string, check for percentage
+        if isinstance(value, str):
+            value_stripped = value.strip()
+            if value_stripped.endswith('%'):
+                try:
+                    percent = float(value_stripped[:-1])
+                    if percent > 0:
+                        # Always apply percentage (supports both downsizing and upscaling)
+                        return int(original_size * percent / 100.0)
+                except ValueError:
+                    pass
+            else:
+                # Try parsing as int string
+                try:
+                    parsed_int = int(value_stripped)
+                    # Only resize if original exceeds the max
+                    if original_size > parsed_int:
+                        return parsed_int
+                    else:
+                        return None  # Keep original size
+                except ValueError:
+                    pass
+        
+        return None
+    
+    def _resize_image(self, image_path: Path, max_width = None, max_height = None) -> bool:
+        """Resize image while maintaining aspect ratio.
+        
+        Args:
+            image_path: Path to the image file
+            max_width: Maximum width - int (pixels), str ("80%"), or None (uses self.diagram_width)
+            max_height: Maximum height - int (pixels), str ("80%"), or None (uses self.diagram_height)
+            
+        Returns:
+            True if resize was successful, False otherwise
+        """
+        try:
+            if max_width is None:
+                max_width = self.diagram_width
+            if max_height is None:
+                max_height = self.diagram_height
+            
+            # Open the image
+            with Image.open(image_path) as img:
+                # Convert image to RGB/RGBA mode if needed (fixes "wrong mode" errors)
+                # Some diagram renderers produce images in palette mode (P) or other modes
+                # that don't support all PIL operations like UnsharpMask filter
+                original_mode = img.mode
+                if img.mode not in ('RGB', 'RGBA'):
+                    # Preserve transparency if present
+                    if img.mode in ('P', 'PA', 'LA') and 'transparency' in img.info:
+                        img = img.convert('RGBA')
+                    else:
+                        img = img.convert('RGB')
+                    self._log_debug(f"Converted image from mode {original_mode} to {img.mode} for processing")
+                
+                # Get original dimensions
+                orig_width, orig_height = img.size
+                
+                self._log_debug(f"Checking resize for {image_path.name}: original={orig_width}x{orig_height}, max={max_width}x{max_height}")
+                
+                # Parse dimensions (resolve percentages based on original size)
+                target_width = self._parse_dimension_value(max_width, orig_width)
+                target_height = self._parse_dimension_value(max_height, orig_height)
+                
+                self._log_debug(f"Parsed target dimensions: width={target_width}, height={target_height}")
+                
+                # If no valid dimensions, skip resize
+                if target_width is None and target_height is None:
+                    self._log_debug(f"Image {orig_width}x{orig_height} is within max constraints {max_width}x{max_height}, no resize needed")
+                    return True
+                
+                # Calculate scaling factor to fit within target dimensions while maintaining aspect ratio
+                if target_width is not None and target_height is not None:
+                    width_ratio = target_width / orig_width
+                    height_ratio = target_height / orig_height
+                    scale_factor = min(width_ratio, height_ratio)
+                elif target_width is not None:
+                    scale_factor = target_width / orig_width
+                else:  # target_height is not None
+                    scale_factor = target_height / orig_height
+                
+                # Only resize if scale factor differs from 1.0
+                if scale_factor != 1.0:
+                    new_width = int(orig_width * scale_factor)
+                    new_height = int(orig_height * scale_factor)
+                    
+                    is_upscaling = scale_factor > 1.0
+                    
+                    # Resize using high-quality Lanczos resampling (best for both up and downscaling)
+                    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                    
+                    # Apply sharpening optimized for the scaling direction
+                    if is_upscaling:
+                        # For upscaling: Use stronger sharpening to enhance details and reduce softness
+                        # radius: larger for upscaling to cover more area
+                        # percent: higher to enhance edges more aggressively
+                        # threshold: lower to sharpen more details
+                        sharpened = resized_img.filter(ImageFilter.UnsharpMask(radius=1.0, percent=200, threshold=2))
+                    else:
+                        # For downscaling: Use moderate sharpening to compensate for resize blur
+                        sharpened = resized_img.filter(ImageFilter.UnsharpMask(radius=0.5, percent=150, threshold=3))
+                    
+                    # Save with maximum quality settings
+                    # For PNG: compress_level 0-9 (higher = smaller file but still lossless)
+                    # For JPEG: quality 95-100 (near-lossless)
+                    if image_path.suffix.lower() in ['.png']:
+                        sharpened.save(image_path, format='PNG', compress_level=6, optimize=False)
+                    elif image_path.suffix.lower() in ['.jpg', '.jpeg']:
+                        sharpened.save(image_path, format='JPEG', quality=100, subsampling=0, optimize=False)
+                    else:
+                        sharpened.save(image_path, optimize=False)
+                    
+                    scale_direction = "upscaled" if is_upscaling else "downscaled"
+                    self._log_debug(f"Resized image from {orig_width}x{orig_height} to {new_width}x{new_height} ({scale_direction} with optimized sharpening)")
+                else:
+                    self._log_debug(f"Image {orig_width}x{orig_height} already within target bounds, no resize needed")
+            
+            return True
+            
+        except Exception as e:
+            self._log_error(f"Failed to resize image {image_path}: {e}")
+            return False
+    
+    async def _render_mermaid_diagram(self, mermaid_code: str, output_path: Path) -> tuple[bool, str]:
         """Render Mermaid diagram to image using Playwright."""
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
                 
-                # Set viewport for high-resolution rendering (reduced by ~30% for better fit)
-                await page.set_viewport_size({"width": 1680, "height": 2240})
+                # Set viewport for high-resolution rendering using fixed pixel dimensions
+                viewport_width, viewport_height = self._get_viewport_dimensions()
+                await page.set_viewport_size({"width": viewport_width, "height": viewport_height})
                 await page.emulate_media(media="screen")
                 
                 # Create HTML with Mermaid
@@ -319,17 +510,18 @@ class MarkdownToPDFConverter:
                 
                 await browser.close()
                 
-                return True
+                return True, ""
                 
         except Exception as e:
-            self._log_error(f"Failed to render Mermaid diagram: {e}")
-            return False
+            error_msg = f"Failed to render Mermaid diagram: {e}"
+            self._log_error(error_msg)
+            return False, error_msg
     
-    def _render_plantuml_diagram(self, plantuml_code: str, output_path: Path) -> bool:
+    def _render_plantuml_diagram(self, plantuml_code: str, output_path: Path) -> tuple[bool, str]:
         """Render PlantUML diagram to image using the plantuml library."""
         try:
-            # Create PlantUML instance with default server URL
-            puml = plantuml.PlantUML(url='http://www.plantuml.com/plantuml')
+            # Create PlantUML instance with HTTPS server URL and PNG endpoint
+            puml = plantuml.PlantUML(url='https://www.plantuml.com/plantuml/png/')
             
             # Render the diagram to PNG and get raw image data
             image_data = puml.processes(plantuml_code)
@@ -341,74 +533,235 @@ class MarkdownToPDFConverter:
             # Check if the file was created successfully
             if output_path.exists() and output_path.stat().st_size > 0:
                 self._log_debug(f"PlantUML diagram rendered successfully to: {output_path}")
-                return True
+                return True, ""
             else:
-                self._log_error(f"PlantUML diagram file was not created or is empty")
-                return False
+                error_msg = "PlantUML diagram file was not created or is empty"
+                self._log_error(error_msg)
+                return False, error_msg
                 
         except Exception as e:
-            self._log_error(f"Failed to render PlantUML diagram: {e}")
-            return False
+            # Handle exception carefully - some PlantUML exceptions don't have proper string representation
+            error_type = type(e).__name__
+            try:
+                error_details = str(e)
+            except:
+                error_details = "Unknown error (exception string conversion failed)"
+            error_msg = f"Failed to render PlantUML diagram: {error_type}: {error_details}"
+            self._log_error(error_msg)
+            return False, error_msg
     
     def _replace_mermaid_with_images(self, content: str, file_id: str = "") -> str:
-        """Replace Mermaid code blocks with image references."""
+        """Replace Mermaid code blocks with image references.
+        
+        Supports HTML comment modifiers on line above diagram:
+        <!-- no-resize -->
+        ```mermaid
+        graph TD
+            A --> B
+        ```
+        
+        <!-- upscale:150% -->
+        ```mermaid
+        graph TD
+            A --> B
+        ```
+        """
         import re
         
-        mermaid_pattern = r'```mermaid\n(.*?)\n```'
-        mermaid_blocks = re.findall(mermaid_pattern, content, re.DOTALL)
+        # Pattern to match optional HTML comment modifiers on line above, followed by mermaid block
+        # Handles both Unix (\n) and Windows (\r\n) line endings
+        # Captures: no-resize OR upscale:X% OR downscale:X%
+        mermaid_pattern = r'(?:<!--\s*(?:(no-resize)|upscale:(\d+)%|downscale:(\d+)%)\s*-->\s*\r?\n)?```mermaid\r?\n(.*?)\r?\n```'
         
-        for i, mermaid_code in enumerate(mermaid_blocks):
+        # Find all matches with their modifiers
+        matches = list(re.finditer(mermaid_pattern, content, re.DOTALL | re.IGNORECASE))
+        
+        for i, match in enumerate(matches):
+            no_resize_modifier = match.group(1)  # "no-resize" or None
+            upscale_percent = match.group(2)  # percentage digits for upscale or None
+            downscale_percent = match.group(3)  # percentage digits for downscale or None
+            mermaid_code = match.group(4)
+            full_block = match.group(0)
+            
+            # Determine resize behavior
+            skip_resize = no_resize_modifier is not None
+            custom_scale = None
+            scale_type = None
+            if upscale_percent:
+                custom_scale = f"{upscale_percent}%"
+                scale_type = "upscale"
+            elif downscale_percent:
+                # For downscale, use percentage directly (must be 0-99%)
+                # downscale:67% means scale to 67% of original size
+                percent_value = float(downscale_percent)
+                if percent_value > 0 and percent_value < 100:
+                    custom_scale = f"{downscale_percent}%"
+                    scale_type = "downscale"
+                else:
+                    self._log_warning(f"Downscale percentage must be between 0-99%, got {downscale_percent}%. Ignoring modifier.")
+            
             # Create unique image path using file_id to avoid race conditions
             image_path = self.temp_dir / f"mermaid_diagram_{file_id}_{i}.png"
             
             # Render Mermaid diagram
-            self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}")
+            modifier_info = ""
+            if skip_resize:
+                modifier_info = " (no-resize)"
+            elif custom_scale and scale_type:
+                modifier_info = f" ({scale_type}:{custom_scale})"
+            self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}{modifier_info}")
             
             # Run async function in sync context
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                success = loop.run_until_complete(self._render_mermaid_diagram(mermaid_code, image_path))
+                success, error_msg = loop.run_until_complete(
+                    self._render_mermaid_diagram(mermaid_code, image_path)
+                )
                 if success:
+                    # Resize the rendered image based on modifiers
+                    if skip_resize:
+                        self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
+                    elif custom_scale:
+                        action = "upscaling" if scale_type == "upscale" else "downscaling"
+                        self._log_debug(f"Applying custom {action} {custom_scale} to Mermaid diagram {i}")
+                        self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
+                    else:
+                        # Use default resize settings
+                        self._resize_image(image_path)
+                    
                     self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
                     # Replace the code block with image reference
                     content = content.replace(
-                        f"```mermaid\n{mermaid_code}\n```",
+                        full_block,
                         f"![]({image_path})"
                     )
                 else:
                     self._log_error(f"Failed to render Mermaid diagram {i}")
+                    # Insert error placeholder with actual error message
+                    error_placeholder = self._create_diagram_error_placeholder("Mermaid", i, mermaid_code, error_msg)
+                    content = content.replace(
+                        full_block,
+                        error_placeholder
+                    )
             finally:
                 loop.close()
         
         return content
     
     def _replace_plantuml_with_images(self, content: str, file_id: str = "") -> str:
-        """Replace PlantUML code blocks with image references."""
+        """Replace PlantUML code blocks with image references.
+        
+        Supports HTML comment modifiers on line above diagram:
+        <!-- no-resize -->
+        ```plantuml
+        @startuml
+        A -> B
+        @enduml
+        ```
+        
+        <!-- upscale:150% -->
+        ```plantuml
+        @startuml
+        A -> B
+        @enduml
+        ```
+        """
         import re
         
-        plantuml_pattern = r'```plantuml\n(.*?)\n```'
-        plantuml_blocks = re.findall(plantuml_pattern, content, re.DOTALL)
+        # Pattern to match optional HTML comment modifiers on line above, followed by plantuml block
+        # Handles both Unix (\n) and Windows (\r\n) line endings
+        # Captures: no-resize OR upscale:X% OR downscale:X%
+        plantuml_pattern = r'(?:<!--\s*(?:(no-resize)|upscale:(\d+)%|downscale:(\d+)%)\s*-->\s*\r?\n)?```plantuml\r?\n(.*?)\r?\n```'
         
-        for i, plantuml_code in enumerate(plantuml_blocks):
+        # Find all matches with their modifiers
+        matches = list(re.finditer(plantuml_pattern, content, re.DOTALL | re.IGNORECASE))
+        
+        for i, match in enumerate(matches):
+            no_resize_modifier = match.group(1)  # "no-resize" or None
+            upscale_percent = match.group(2)  # percentage digits for upscale or None
+            downscale_percent = match.group(3)  # percentage digits for downscale or None
+            plantuml_code = match.group(4)
+            full_block = match.group(0)
+            
+            # Determine resize behavior
+            skip_resize = no_resize_modifier is not None
+            custom_scale = None
+            scale_type = None
+            if upscale_percent:
+                custom_scale = f"{upscale_percent}%"
+                scale_type = "upscale"
+            elif downscale_percent:
+                # For downscale, use percentage directly (must be 0-99%)
+                # downscale:67% means scale to 67% of original size
+                percent_value = float(downscale_percent)
+                if percent_value > 0 and percent_value < 100:
+                    custom_scale = f"{downscale_percent}%"
+                    scale_type = "downscale"
+                else:
+                    self._log_warning(f"Downscale percentage must be between 0-99%, got {downscale_percent}%. Ignoring modifier.")
+            
             # Create unique image path using file_id to avoid race conditions
             image_path = self.temp_dir / f"plantuml_diagram_{file_id}_{i}.png"
             
             # Render PlantUML diagram
-            self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}")
+            modifier_info = ""
+            if skip_resize:
+                modifier_info = " (no-resize)"
+            elif custom_scale and scale_type:
+                modifier_info = f" ({scale_type}:{custom_scale})"
+            self._log_debug(f"Rendering PlantUML diagram {i} to: {image_path}{modifier_info}")
             
-            success = self._render_plantuml_diagram(plantuml_code, image_path)
+            success, error_msg = self._render_plantuml_diagram(plantuml_code, image_path)
             if success:
+                # Resize the rendered image based on modifiers
+                if skip_resize:
+                    self._log_debug(f"Skipping resize for PlantUML diagram {i} due to no-resize modifier")
+                elif custom_scale:
+                    action = "upscaling" if scale_type == "upscale" else "downscaling"
+                    self._log_debug(f"Applying custom {action} {custom_scale} to PlantUML diagram {i}")
+                    self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
+                else:
+                    # Use default resize settings
+                    self._resize_image(image_path)
+                
                 self._log_debug(f"PlantUML diagram rendered successfully, using path: {image_path}")
                 # Replace the code block with image reference
                 content = content.replace(
-                    f"```plantuml\n{plantuml_code}\n```",
+                    full_block,
                     f"![]({image_path})"
                 )
             else:
                 self._log_error(f"Failed to render PlantUML diagram {i}")
+                # Insert error placeholder with actual error message
+                error_placeholder = self._create_diagram_error_placeholder("PlantUML", i, plantuml_code, error_msg)
+                content = content.replace(
+                    full_block,
+                    error_placeholder
+                )
         
         return content
+    
+    def _create_diagram_error_placeholder(self, diagram_type: str, diagram_index: int, diagram_code: str, error_message: str = "") -> str:
+        """Create a formatted error placeholder for failed diagram rendering."""
+        # Truncate diagram code for display (first 60 characters)
+        truncated_code = diagram_code[:60] + "..." if len(diagram_code) > 60 else diagram_code
+        
+        # Create a compact formatted error message
+        error_placeholder = f"""
+<div style="border: 1px solid #ff6b6b; border-radius: 4px; padding: 8px; margin: 8px 0; background-color: #fff5f5; font-family: Arial, sans-serif; font-size: 0.85em;">
+    <div style="color: #d63031; font-weight: bold; margin-bottom: 4px;">
+        ⚠️ {diagram_type} Diagram Failed
+    </div>
+    <div style="color: #2d3436; margin-bottom: 4px; font-size: 0.9em;">
+        <strong>Error:</strong> {error_message if error_message else "Unknown error occurred during diagram rendering"}
+    </div>
+    <div style="color: #636e72; font-size: 0.8em; margin-bottom: 2px;">
+        <strong>Code:</strong> <code style="background-color: #f8f9fa; padding: 1px 3px; border-radius: 2px;">{truncated_code}</code>
+    </div>
+</div>
+"""
+        return error_placeholder
     
     def _process_page_breaks(self, content: str) -> str:
         """Process page break markers in markdown content."""
@@ -508,10 +861,21 @@ class MarkdownToPDFConverter:
             if img_path.startswith('http') or img_path.startswith('data:'):
                 continue
             
-            # Check if this is a Mermaid diagram generated by our script
+            # Check if this is a diagram generated by our script (Mermaid or PlantUML)
             if img_path.startswith('temp/') or img_path.startswith('temp\\'):
-                # Mermaid diagrams are already in the temp directory, no need to copy
-                self._log_debug(f"Skipping Mermaid diagram (already in temp): {img_path}")
+                # Convert relative temp path to absolute path for pandoc
+                if not os.path.isabs(img_path):
+                    # Convert to absolute path
+                    abs_img_path = self.temp_dir / img_path.replace('temp/', '').replace('temp\\', '')
+                    if abs_img_path.exists():
+                        # Replace the relative path with absolute path
+                        processed_content = processed_content.replace(
+                            f"]({img_path})",
+                            f"]({abs_img_path})"
+                        )
+                        self._log_debug(f"Converted temp image path to absolute: {img_path} -> {abs_img_path}")
+                    else:
+                        self._log_warning(f"Temp image not found: {abs_img_path}")
                 continue
                 
             # Resolve relative path from markdown file location
@@ -547,10 +911,21 @@ class MarkdownToPDFConverter:
             if img_path.startswith('http') or img_path.startswith('data:'):
                 continue
             
-            # Check if this is a Mermaid diagram generated by our script
+            # Check if this is a diagram generated by our script (Mermaid or PlantUML)
             if img_path.startswith('temp/') or img_path.startswith('temp\\'):
-                # Mermaid diagrams are already in the temp directory, no need to copy
-                self._log_debug(f"Skipping Mermaid diagram (already in temp): {img_path}")
+                # Convert relative temp path to absolute path for pandoc
+                if not os.path.isabs(img_path):
+                    # Convert to absolute path
+                    abs_img_path = self.temp_dir / img_path.replace('temp/', '').replace('temp\\', '')
+                    if abs_img_path.exists():
+                        # Replace the relative path with absolute path
+                        processed_content = processed_content.replace(
+                            f"]({img_path})",
+                            f"]({abs_img_path})"
+                        )
+                        self._log_debug(f"Converted temp image path to absolute: {img_path} -> {abs_img_path}")
+                    else:
+                        self._log_warning(f"Temp image not found: {abs_img_path}")
                 continue
                 
             # Resolve relative path from markdown file location
@@ -901,7 +1276,9 @@ class MarkdownToPDFConverter:
                     },
                     print_background=True,
                     prefer_css_page_size=True,
-                    display_header_footer=False,
+                    display_header_footer=True,
+                    header_template='<div></div>',
+                    footer_template='<div style="font-size: 10px; text-align: center; width: 100%; margin: 0 auto;"><span class="pageNumber"></span></div>',
                     scale=1.0
                 )
                 
@@ -921,7 +1298,8 @@ class MarkdownToPDFConverter:
             # Check if conversion is needed before processing
             current_markdown_hash = calculate_file_hash(md_file)
             
-            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
+            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
+                                                        self.diagram_width, self.diagram_height, self.page_margins, True):
                 self._log_info(f"Skipping {filename} - PDF is up to date")
                 return True, filename  # Success but skipped
             
@@ -1017,7 +1395,10 @@ class MarkdownToPDFConverter:
                 if success:
                     # Calculate PDF hash and save document state
                     pdf_hash = calculate_file_hash(output_pdf)
-                    self.state_manager.save_document_state(filename, current_markdown_hash, pdf_hash, self.style_profile)
+                    self.state_manager.save_document_state(
+                        filename, current_markdown_hash, pdf_hash, self.style_profile,
+                        self.diagram_width, self.diagram_height, self.page_margins, True
+                    )
                     self._log_success(f"Converted {md_file.name} to {output_pdf.name}")
                     return True
                 else:
@@ -1042,6 +1423,8 @@ class MarkdownToPDFConverter:
         md_files = [f for f in md_files if f.name != "README.md"]
         
         self._log_info("Starting markdown to PDF conversion...")
+        self._log_info(f"Source directory: {self.source_dir.absolute()}")
+        self._log_info(f"Output directory: {self.pdf_dir.absolute()}")
         self._log_info(f"Found {len(md_files)} markdown files: {[f.name for f in md_files]}")
         
         if parallel and len(md_files) > 1:
@@ -1071,7 +1454,8 @@ class MarkdownToPDFConverter:
                         current_markdown_hash = calculate_file_hash(md_file)
                         output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
                         
-                        if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
+                        if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
+                                                                     self.diagram_width, self.diagram_height, self.page_margins, True):
                             skipped_count += 1
                         else:
                             success_count += 1
@@ -1101,7 +1485,10 @@ class MarkdownToPDFConverter:
                 current_markdown_hash = calculate_file_hash(md_file)
                 output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
                 
-                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile):
+                if not self.state_manager.needs_regeneration(
+                    filename, current_markdown_hash, output_pdf, self.style_profile,
+                    self.diagram_width, self.diagram_height, self.page_margins, True
+                ):
                     skipped_count += 1
                 else:
                     success_count += 1
@@ -1120,9 +1507,10 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Convert markdown files to PDF with Mermaid and PlantUML support (Puppeteer approach)")
-    parser.add_argument("--source", default="docs", help="Source directory (default: docs)")
-    parser.add_argument("--pdf-dir", default="pdf", help="PDF output directory (default: pdf)")
-    parser.add_argument("--temp-dir", default="temp", help="Temporary files directory (default: temp)")
+    parser.add_argument("--source", default=None, help="Source directory (default: from config/env/docs)")
+    parser.add_argument("--output-dir", default=None, help="Output directory (default: from config/env/output). PDF files will be saved in output/pdf/ subfolder")
+    parser.add_argument("--temp-dir", default=None, help="Temporary files directory (default: from config/env/temp)")
+    parser.add_argument("--db-path", default=None, help="Database path (default: from config/env/user config dir)")
     parser.add_argument("--margins", default="1in 0.75in", help="Page margins in CSS format (default: '1in 0.75in'). Range: 0-3 inches. Use 1, 2, or 4 values. Units: in, cm, mm, pt, px")
     parser.add_argument("--profile", default="a4-print", choices=["a4-print", "a4-screen"], help="Style profile for PDF generation (default: 'a4-print'). Available: a4-print (standard), a4-screen (30% larger fonts)")
     parser.add_argument("--no-cleanup", action="store_true", help="Keep temporary files")
@@ -1130,13 +1518,40 @@ def main():
     parser.add_argument("--cleanup-db", action="store_true", help="Clear all document state records from database and exit")
     parser.add_argument("--max-workers", type=int, default=4, help="Maximum number of parallel workers for PDF conversion (default: 4)")
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing and use sequential conversion")
+    parser.add_argument("--max-diagram-width", type=str, default=None, help="Maximum diagram width: pixels (e.g., 1680, only if rendered exceeds) or percentage of rendered size (e.g., 80%%, max 100%%). Default: 1680")
+    parser.add_argument("--max-diagram-height", type=str, default=None, help="Maximum diagram height: pixels (e.g., 2240, only if rendered exceeds) or percentage of rendered size (e.g., 80%%, max 100%%). Default: 2240")
     
     args = parser.parse_args()
+    
+    # Build config from CLI args
+    cli_config = {}
+    if args.source:
+        cli_config["source_dir"] = args.source
+    if args.output_dir:
+        cli_config["output_dir"] = args.output_dir
+    if args.temp_dir:
+        cli_config["temp_dir"] = args.temp_dir
+    if args.db_path:
+        cli_config["db_path"] = args.db_path
+    if args.max_diagram_width:
+        # Parse dimension value (can be int string or percentage)
+        from .config import parse_dimension_value
+        parsed = parse_dimension_value(args.max_diagram_width)
+        if parsed is not None:
+            cli_config["max_diagram_width"] = parsed
+    if args.max_diagram_height:
+        # Parse dimension value (can be int string or percentage)
+        from .config import parse_dimension_value
+        parsed = parse_dimension_value(args.max_diagram_height)
+        if parsed is not None:
+            cli_config["max_diagram_height"] = parsed
+    
+    config = Config(cli_config)
     
     # Handle database cleanup if requested
     if args.cleanup_db:
         try:
-            state_manager = DocumentStateManager()
+            state_manager = DocumentStateManager(config.get_db_path())
             count = state_manager.clear_all_documents()
             print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Cleared {count} document state records from database")
             return
@@ -1145,46 +1560,21 @@ def main():
             sys.exit(1)
     
     # Check dependencies
-    try:
-        subprocess.run(["pandoc", "--version"], capture_output=True, check=True)
-        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Pandoc is available")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: pandoc is required but not found. Please install pandoc.")
-        sys.exit(1)
-    
-    try:
-        import playwright
-        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Playwright is available")
-    except ImportError:
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: playwright is required but not found. Please install playwright.")
-        print("Run: pip install playwright && playwright install chromium")
-        sys.exit(1)
-    
-    try:
-        import plantuml
-        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} PlantUML is available")
-    except ImportError:
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: plantuml is required but not found. Please install plantuml.")
-        print("Run: pip install plantuml")
-        sys.exit(1)
-    
-    try:
-        import colorama
-        print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} Colorama is available")
-    except ImportError:
-        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Error: colorama is required but not found. Please install colorama.")
-        print("Run: pip install colorama")
+    if not check_dependencies(check_optional=False):
         sys.exit(1)
     
     # Run conversion
     converter = MarkdownToPDFConverter(
-        args.source, 
-        args.pdf_dir, 
-        args.temp_dir, 
+        config.get_source_dir(), 
+        config.get_output_dir(), 
+        config.get_temp_dir(), 
         args.margins, 
         args.debug, 
+        db_path=config.get_db_path(),
         style_profile=args.profile,
-        max_workers=args.max_workers
+        max_workers=args.max_workers,
+        max_diagram_width=config.get_max_diagram_width(),
+        max_diagram_height=config.get_max_diagram_height()
     )
     converter.convert_all(cleanup=not args.no_cleanup, parallel=not args.no_parallel)
 

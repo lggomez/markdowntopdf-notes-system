@@ -1,232 +1,243 @@
 # Markdown to PDF Converter
 
-A Python script that converts all markdown files in the current directory to PDF format, with support for rendering Mermaid and PlantUML diagrams as images.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-python convert_md_to_pdf.py --margins "20mm 25mm"
+Convert markdown files to PDF, EPUB, or MOBI with Mermaid and PlantUML diagram support.
 
-## Features
+## Quick Start
 
-- Page breaks via <div class="page-break"></div>
-- Converts all `.md` files in the current directory to PDF
-- Renders Mermaid diagrams as images and embeds them in the PDF
-- Renders PlantUML diagrams as images and embeds them in the PDF
-- Supports custom page breaks for better document structure
-- Uses your existing `mermaid-config.json` for consistent Mermaid diagram styling
-- **Style Profiles**: Choose between print-optimized and screen-optimized styling
-- Saves PDFs in a `pdf/` subdirectory
-- Uses `temp/` subdirectory for intermediate files (with cleanup option)
-- No LaTeX dependencies - uses Playwright (Chromium) for clean HTML-to-PDF conversion
+```bash
+# Install Poetry (if needed)
+curl -sSL https://install.python-poetry.org | python3 -
+
+# Setup
+git clone https://github.com/lggomez/markdowntopdf-notes-system && cd markdowntopdf-notes-system
+poetry install
+poetry run playwright install chromium
+
+# Convert
+poetry run md2pdf --source ./docs
+```
 
 ## Prerequisites
 
-### External Dependencies
-You need to install these tools separately:
-
-1. **Pandoc** - Document converter
-   - Windows: Download from https://pandoc.org/installing.html
-   - macOS: `brew install pandoc`
-   - Linux: `sudo apt-get install pandoc` or `sudo yum install pandoc`
-
-### Python Dependencies
-The script uses Playwright for Mermaid diagram rendering and the plantuml library for PlantUML diagram rendering.
+- **Python 3.8+**
+- **Pandoc**: https://pandoc.org/installing.html
+- **Calibre** (optional, for MOBI): https://calibre-ebook.com/download
 
 ## Installation
 
-1. **Run the setup script** (recommended):
-   ```bash
-   python setup.py
-   ```
-
-2. **Or install manually**:
-   ```bash
-   pip install -r requirements.txt
-   playwright install chromium
-   ```
+```bash
+poetry install
+poetry run playwright install chromium
+```
 
 ## Usage
 
 ### Basic Usage
-```bash
-python convert_md_to_pdf.py
-```
-
-This will:
-- Find all `.md` files in the current directory
-- Convert them to PDF with rendered Mermaid and PlantUML diagrams
-- Save PDFs in the `pdf/` folder
-- Clean up temporary files
-
-### Advanced Usage
-```bash
-# Specify custom directories
-python convert_md_to_pdf.py --source ./docs --pdf-dir ./output --temp-dir ./working
-
-# Use screen-optimized style profile (30% larger fonts)
-python convert_md_to_pdf.py --profile a4-screen
-
-# Use print-optimized style profile (default)
-python convert_md_to_pdf.py --profile a4-print
-
-# Keep temporary files for debugging
-python convert_md_to_pdf.py --no-cleanup
-
-# Enable debug logging for detailed output
-python convert_md_to_pdf.py --debug
-
-# Clear document verification database (forces regeneration of all PDFs)
-python convert_md_to_pdf.py --cleanup-db
-
-# Combine options
-python convert_md_to_pdf.py --debug --no-cleanup --margins "20mm 25mm" --profile a4-screen
-
-# Get help
-python convert_md_to_pdf.py --help
-```
-
-## How It Works
-
-1. **Verification Check**: For each markdown file, calculates SHA-256 hash and checks against stored state
-2. **Style Profile Check**: Compares current style profile with the one used for the last generation
-3. **Smart Processing**: Only processes files that have changed, are missing, or have a different style profile
-4. **Diagram Processing**: The script finds all `\`\`\`mermaid` and `\`\`\`plantuml` code blocks in your markdown files
-5. **Diagram Rendering**: 
-   - Mermaid diagrams are rendered to PNG images using Playwright
-   - PlantUML diagrams are rendered to PNG images using the plantuml library
-6. **Content Replacement**: Diagram code blocks are replaced with image references
-7. **PDF Generation**: The processed markdown is converted to PDF using Pandoc + Playwright (Chromium) with the selected style profile
-8. **State Update**: Saves markdown hash, PDF hash, and style profile to SQLite database for future verification
-9. **Cleanup**: Temporary files are removed (unless `--no-cleanup` is specified)
-
-## Verification System
-
-The converter includes a verification system that avoids unnecessary file recreations:
-- **SHA-256 Hashing**: Each markdown file is hashed to detect changes
-- **Style Profile Tracking**: Database tracks which style profile was used for each document
-- **SQLite Database**: Document state is stored in `state/document_state.db` 
-- **Smart Skipping**: Unchanged files with same style profile are skipped entirely (no processing, no diagram rendering)
-- **Automatic Updates**: State is updated after successful PDF generation
-- **Profile Change Detection**: Switching style profiles triggers regeneration of affected documents
-
-### Database Management
 
 ```bash
-# Clear all verification state (forces regeneration of all PDFs)
-python convert_md_to_pdf.py --cleanup-db
+# PDF conversion (default settings)
+poetry run md2pdf --source ./docs
 
-# Normal run (uses verification to skip unchanged files)
-python convert_md_to_pdf.py
+# EPUB/MOBI conversion
+poetry run md2ebook --format epub --source ./docs
+poetry run md2ebook --format mobi --source ./docs
 ```
 
-## Style Profiles
-
-The converter supports different style profiles optimized for different use cases:
-
-### Available Profiles
-
-- **`a4-print`** (default): Standard print-optimized styling
-  - Base font size: 12px
-  - Optimized for physical printing
-  - Standard margins and spacing
-
-- **`a4-screen`**: Screen-optimized styling with larger fonts
-  - Base font size: 15.6px (30% larger)
-  - Optimized for screen reading
-  - Better readability on digital displays
-
-### Usage Examples
+### Advanced Examples
 
 ```bash
-# Use default print profile
-python convert_md_to_pdf.py
+# Limit diagram size with screen-optimized profile  
+poetry run md2pdf --source ./docs --output-dir ./my-pdfs --profile a4-screen --max-diagram-width 1200 --max-diagram-height 1600
 
-# Use screen-optimized profile
-python convert_md_to_pdf.py --profile a4-screen
+# Resize diagrams to 80% of rendered size
+poetry run md2pdf --source ./docs --max-diagram-width 80% --max-diagram-height 80%
 
-# Switch back to print profile (triggers regeneration)
-python convert_md_to_pdf.py --profile a4-print
+# Resize diagrams to 50% for smaller file sizes
+poetry run md2pdf --source ./docs --max-diagram-width 50% --max-diagram-height 50% --profile a4-screen
+
+# Debug mode with custom margins and temp files preserved
+poetry run md2pdf --source ./technical-docs --output-dir ./output --margins "0.75in 0.5in" --debug --no-cleanup
+
+# Allow larger diagrams but cap at 2400x3200
+poetry run md2pdf --source ./docs --max-diagram-width 2400 --max-diagram-height 3200 --max-workers 8 --profile a4-print
+
+# EPUB with percentage-based diagram sizing
+poetry run md2ebook --format epub --source ./book-chapters --output-dir ./ebooks --author "John Doe" --language "en" --profile kindle-paperwhite-11 --max-diagram-width 70% --max-diagram-height 70%
+
+# Sequential processing for debugging specific diagram issues
+poetry run md2pdf --source ./docs --no-parallel --debug --no-cleanup --max-diagram-width 1680 --max-diagram-height 2240
+
+# MOBI conversion with all custom settings
+poetry run md2ebook --format mobi --source ./manuscript --output-dir ./publish --author "Jane Smith" --language "en" --profile kindle-large --max-diagram-width 1200 --max-diagram-height 1600 --max-workers 4 --debug
+
+# Maintenance: Clear cache and regenerate all
+poetry run md2pdf --cleanup-db && poetry run md2pdf --source ./docs
 ```
 
-### Smart Regeneration
+### Common Options
 
-The system tracks which style profile was used for each document. When you switch profiles:
-- Documents are automatically regenerated with the new styling
-- Same profile runs skip unchanged files for efficiency
-- Database tracks both content changes and style profile changes
+- `--source DIR` - Source directory (default: `./docs`)
+- `--output-dir DIR` - Output directory (default: `./output`)
+- `--profile {a4-print,a4-screen}` - Style profile (default: `a4-print`)
+- `--max-diagram-width VALUE` - Max diagram width: pixels (only if rendered exceeds, e.g., `1680`) or percentage (e.g., `80%`, max 100%) - Default: `1680`
+- `--max-diagram-height VALUE` - Max diagram height: pixels (only if rendered exceeds, e.g., `2240`) or percentage (e.g., `80%`, max 100%) - Default: `2240`
+- `--margins "TOP RIGHT BOTTOM LEFT"` - Page margins (default: `"1in 0.75in"`)
+- `--max-workers NUM` - Parallel workers (default: `4`)
+- `--no-parallel` - Disable parallel processing
+- `--debug` - Enable debug logging
+- `--no-cleanup` - Keep temporary files
+- `--cleanup-db` - Clear verification database and recreate with current schema
+
+### Ebook-Specific Options
+
+- `--format {pdf,epub,mobi}` - Output format (default: `pdf`)
+- `--author "NAME"` - Author metadata (default: `"Unknown Author"`)
+- `--language CODE` - Language code (default: `"en"`)
+- `--profile` - Additional profiles: `kindle-basic`, `kindle-large`, `kindle-paperwhite-11`
+
+## Features
+
+- Renders Mermaid and PlantUML diagrams as images
+- **Configurable diagram dimensions** with automatic resizing
+- **Per-diagram resize control** with `<!-- no-resize -->`, `<!-- upscale:X% -->`, and `<!-- downscale:X% -->` modifiers
+- **Automatic page numbering** in PDF footer (centered)
+- Smart verification (skips unchanged files)
+- Style profiles: `a4-print` (12px) or `a4-screen` (15.6px)
+- Page breaks: `<!-- page-break -->` or `<div class="page-break"></div>`
+- Output: `output/pdf/`, `output/epub/`, `output/mobi/`
 
 ## Configuration
 
-The script automatically uses your `mermaid-config.json` file if present, ensuring consistent Mermaid diagram styling across all generated PDFs. PlantUML diagrams use default styling.
-
-## Page Breaks
-
-You can control page breaks in your PDF output using any of these methods:
-
-### Supported Page Break Syntax
-
-**Option 1: HTML Comment (Recommended)**
-```markdown
-<!-- page-break -->
-```
-
-**Option 2: HTML Div**
-```markdown
-<div class="page-break"></div>
-```
-
-**Option 3: Custom Tag**
-```markdown
-<page-break>
-```
-
-### Common Issues
-
-1. **"pandoc not found"**
-   - Install Pandoc from https://pandoc.org/installing.html
-   - Make sure it's in your PATH
-
-2. **"wkhtmltopdf not found"**
-   - Install wkhtmltopdf from https://wkhtmltopdf.org/downloads.html
-   - Make sure it's in your PATH
-
-3. **"Playwright browser not found"**
-   - Run: `playwright install chromium`
-
-4. **Mermaid diagrams not rendering**
-   - Check your Mermaid syntax
-   - Ensure you have internet connection (for Mermaid CDN)
-   - Check the temp directory for error messages
-
-5. **PlantUML diagrams not rendering**
-   - Check your PlantUML syntax
-   - Ensure the plantuml library is installed: `pip install plantuml`
-   - Check the temp directory for error messages
-
-6. **Style profile not working as expected**
-   - Verify the profile name is correct: `a4-print` or `a4-screen`
-   - Check that the database was updated: `python convert_md_to_pdf.py --cleanup-db` to reset
-   - Use `--debug` to see which profile is being used
-
-### Debug Mode
-Use `--debug` to enable detailed logging and `--no-cleanup` to keep temporary files for inspection:
+**Environment Variables:**
 ```bash
-# Enable debug logging to see detailed processing information
-python convert_md_to_pdf.py --debug
-
-# Keep temporary files for inspection
-python convert_md_to_pdf.py --no-cleanup
-
-# Combine both for full debugging
-python convert_md_to_pdf.py --debug --no-cleanup
+export MD2PDF_SOURCE_DIR="./docs"
+export MD2PDF_OUTPUT_DIR="./output"
+export MD2PDF_MAX_DIAGRAM_WIDTH="1680"
+export MD2PDF_MAX_DIAGRAM_HEIGHT="2240"
 ```
-## Examples
 
-### Minimal Example
-Convert `docs/example.md` to PDF:
+**Config File:** `~/.config/markdown-to-pdf/config.json` (Linux/Mac) or `%APPDATA%/markdown-to-pdf/config.json` (Windows)
+
+**Precedence:** CLI > Environment > Config > Defaults
+
+**Diagram Dimensions:**
+
+Configure maximum diagram dimensions globally. Rendered images are automatically resized to fit within these bounds while maintaining aspect ratio.
+
+**Supports two formats:**
+- **Maximum pixels**: `1680`, `2400`, etc. - Only resizes if rendered diagram exceeds this size
+- **Percentage of rendered size**: `80%`, `50%`, etc. - Always scales to percentage (max 100%)
 
 ```bash
-python convert_md_to_pdf.py --source ./docs
+# Via CLI - Maximum pixels (only resize if diagram exceeds 1200x1600)
+poetry run md2pdf --max-diagram-width 1200 --max-diagram-height 1600 --source ./docs
+
+# Via CLI - Percentage of rendered size (always resizes)
+poetry run md2pdf --max-diagram-width 80% --max-diagram-height 80% --source ./docs
+
+# Via environment variables
+export MD2PDF_MAX_DIAGRAM_WIDTH="1200"
+export MD2PDF_MAX_DIAGRAM_HEIGHT="80%"
+
+# Via config file: ~/.config/markdown-to-pdf/config.json
+{
+  "max_diagram_width": "80%",
+  "max_diagram_height": "80%"
+}
 ```
+
+**How it works:**
+- Diagrams render at high resolution (default viewport: 1680x2240)
+- **Pixels**: Maximum constraint - only resize if rendered exceeds this (e.g., a 800px diagram stays 800px with `--max-diagram-width 1200`)
+- **Percentage**: Always resizes based on rendered size (e.g., `80%` of a 2000px diagram = 1600px)
+- Aspect ratio is always preserved
+- Only downscales (never upscales, except for percentage >100%)
+- No changes required to your markdown diagram code
+
+**Per-Diagram Control:**
+
+You can control resizing for individual diagrams using HTML comments on the line above:
+
+```markdown
+# This diagram will be resized according to global settings
+\`\`\`mermaid
+graph TD
+    A --> B
+\`\`\`
+
+# This diagram keeps its original rendered size (no resize)
+<!-- no-resize -->
+\`\`\`mermaid
+graph TD
+    A --> B
+\`\`\`
+
+# This diagram is scaled to 150% (1.5x larger)
+<!-- upscale:150% -->
+\`\`\`mermaid
+graph TD
+    A --> B
+\`\`\`
+
+# This diagram is downscaled to 67% of original size
+<!-- downscale:67% -->
+\`\`\`mermaid
+graph TD
+    A --> B
+\`\`\`
+
+# Works with PlantUML too
+<!-- upscale:200% -->
+\`\`\`plantuml
+@startuml
+A -> B
+@enduml
+\`\`\`
+```
+
+**Available modifiers:**
+- `<!-- no-resize -->` - Keep original rendered size (skip all resizing)
+- `<!-- upscale:X% -->` - Scale up to X% of original (X > 100, e.g., `150%` = 1.5x larger, `200%` = 2x larger)
+- `<!-- downscale:X% -->` - Scale down to X% of original (0 < X < 100, e.g., `67%` = 67% of original, `50%` = half size)
+
+## Troubleshooting
+
+**Debug Mode:**
+```bash
+# Enable detailed logging and keep temporary files
+poetry run md2pdf --debug --no-cleanup --source ./docs
+
+# Check temp directory for intermediate files
+ls -la ./temp/
+```
+
+**Common Issues:**
+
+1. **Diagrams not rendering**: Check Playwright installation
+   ```bash
+   poetry run playwright install chromium
+   ```
+
+2. **Cache issues or after updates**: Clear and recreate the verification database
+   ```bash
+   poetry run md2pdf --cleanup-db
+   ```
+   This will drop and recreate the database table with the current schema, useful after updates
+
+3. **Large diagrams cut off**: Increase maximum diagram dimensions
+   ```bash
+   poetry run md2pdf --max-diagram-width 2400 --max-diagram-height 3200 --source ./docs
+   ```
+
+4. **Parallel processing issues**: Disable parallel mode
+   ```bash
+   poetry run md2pdf --no-parallel --debug --source ./docs
+   ```
 
 ## License
 
-This script is provided as-is
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2025 Markdown to PDF Converter

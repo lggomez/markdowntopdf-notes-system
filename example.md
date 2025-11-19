@@ -13,6 +13,17 @@ graph TD
     D --> E
 ```
 
+## 1b) Mermaid diagram without resizing
+
+This diagram uses the `<!-- no-resize -->` comment to keep its original rendered size:
+
+<!-- no-resize -->
+```mermaid
+graph LR
+    A[No Resize] --> B[Original Size]
+    B --> C[Full Resolution]
+```
+
 ## 2) PlantUML sequence
 
 ```plantuml
