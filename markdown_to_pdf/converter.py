@@ -48,12 +48,13 @@ class MarkdownToPDFConverter:
         }
     }
     
-    def __init__(self, source_dir: str, output_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: Optional[str] = None, style_profile: str = "a4-print", max_workers: int = 4, max_diagram_width = 1680, max_diagram_height = 2240):
+    def __init__(self, source_dir: str, output_dir: str, temp_dir: str, page_margins: str = "1in 0.75in", debug: bool = False, db_path: Optional[str] = None, style_profile: str = "a4-print", max_workers: int = 4, max_diagram_width = 1680, max_diagram_height = 2240, force_regenerate: bool = False):
         """Initialize the converter.
         
         Args:
             max_diagram_width: Max width in pixels (int, only resize if rendered exceeds) or percentage of rendered size (str like "80%")
             max_diagram_height: Max height in pixels (int, only resize if rendered exceeds) or percentage of rendered size (str like "80%")
+            force_regenerate: If True, bypass verification and regenerate all files
         """
         self.source_dir = Path(source_dir)
         self.output_dir = Path(output_dir)
@@ -64,7 +65,14 @@ class MarkdownToPDFConverter:
         self.max_workers = max_workers
         self.diagram_width = max_diagram_width
         self.diagram_height = max_diagram_height
+        self.force_regenerate = force_regenerate
         self._lock = threading.Lock()  # For thread-safe logging
+        
+        # Performance optimization: reuse browser and event loop (thread-local for parallel safety)
+        self._thread_local = threading.local()
+        
+        # Performance optimization: reuse PlantUML client for connection pooling
+        self._plantuml_client = plantuml.PlantUML(url='https://www.plantuml.com/plantuml/png/')
         
         # Create format-specific output directory
         self.pdf_dir = self.output_dir / "pdf"
@@ -115,6 +123,41 @@ class MarkdownToPDFConverter:
         """Log success message with color."""
         with self._lock:
             print(f"{Fore.GREEN}[OK]{Style.RESET_ALL} {message}")
+    
+    async def _ensure_browser(self) -> None:
+        """Ensure browser instance is initialized and ready. Reuses existing browser if available (thread-safe)."""
+        # Access thread-local storage
+        tls = self._thread_local
+        
+        if not hasattr(tls, 'browser') or tls.browser is None or not tls.browser.is_connected():
+            self._log_debug("Initializing browser instance for reuse")
+            if not hasattr(tls, 'playwright') or tls.playwright is None:
+                tls.playwright = await async_playwright().start()
+            tls.browser = await tls.playwright.chromium.launch(headless=True)
+        
+        # Always create a new page for each render to prevent state carryover
+        # Close existing page if it exists
+        if hasattr(tls, 'page') and tls.page and not tls.page.is_closed():
+            await tls.page.close()
+        tls.page = await tls.browser.new_page()
+    
+    async def _close_browser(self) -> None:
+        """Close browser and cleanup resources (thread-safe)."""
+        try:
+            tls = self._thread_local
+            
+            if hasattr(tls, 'page') and tls.page and not tls.page.is_closed():
+                await tls.page.close()
+                tls.page = None
+            if hasattr(tls, 'browser') and tls.browser and tls.browser.is_connected():
+                await tls.browser.close()
+                tls.browser = None
+            if hasattr(tls, 'playwright') and tls.playwright:
+                await tls.playwright.stop()
+                tls.playwright = None
+            self._log_debug("Browser instance closed and cleaned up")
+        except Exception as e:
+            self._log_warning(f"Error during browser cleanup: {e}")
     
     def _validate_margin(self, margin_str: str) -> str:
         """Validate and normalize a single margin value."""
@@ -298,12 +341,14 @@ class MarkdownToPDFConverter:
                 # Some diagram renderers produce images in palette mode (P) or other modes
                 # that don't support all PIL operations like UnsharpMask filter
                 original_mode = img.mode
+                mode_converted = False
                 if img.mode not in ('RGB', 'RGBA'):
                     # Preserve transparency if present
                     if img.mode in ('P', 'PA', 'LA') and 'transparency' in img.info:
                         img = img.convert('RGBA')
                     else:
                         img = img.convert('RGB')
+                    mode_converted = True
                     self._log_debug(f"Converted image from mode {original_mode} to {img.mode} for processing")
                 
                 # Get original dimensions
@@ -317,9 +362,19 @@ class MarkdownToPDFConverter:
                 
                 self._log_debug(f"Parsed target dimensions: width={target_width}, height={target_height}")
                 
-                # If no valid dimensions, skip resize
+                # If no valid dimensions, check if we need to save mode conversion
                 if target_width is None and target_height is None:
-                    self._log_debug(f"Image {orig_width}x{orig_height} is within max constraints {max_width}x{max_height}, no resize needed")
+                    if mode_converted:
+                        # Save the mode-converted image even though no resize is needed
+                        if image_path.suffix.lower() in ['.png']:
+                            img.save(image_path, format='PNG', compress_level=6, optimize=False)
+                        elif image_path.suffix.lower() in ['.jpg', '.jpeg']:
+                            img.save(image_path, format='JPEG', quality=100, subsampling=0, optimize=False)
+                        else:
+                            img.save(image_path, optimize=False)
+                        self._log_debug(f"Saved mode-converted image (no resize needed)")
+                    else:
+                        self._log_debug(f"Image {orig_width}x{orig_height} is within max constraints {max_width}x{max_height}, no resize needed")
                     return True
                 
                 # Calculate scaling factor to fit within target dimensions while maintaining aspect ratio
@@ -377,140 +432,188 @@ class MarkdownToPDFConverter:
     async def _render_mermaid_diagram(self, mermaid_code: str, output_path: Path) -> tuple[bool, str]:
         """Render Mermaid diagram to image using Playwright."""
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
+            # Reuse browser instance (thread-safe)
+            await self._ensure_browser()
+            page = self._thread_local.page
+            
+            # Set viewport for high-resolution rendering using fixed pixel dimensions
+            viewport_width, viewport_height = self._get_viewport_dimensions()
+            await page.set_viewport_size({"width": viewport_width, "height": viewport_height})
+            await page.emulate_media(media="screen")
                 
-                # Set viewport for high-resolution rendering using fixed pixel dimensions
-                viewport_width, viewport_height = self._get_viewport_dimensions()
-                await page.set_viewport_size({"width": viewport_width, "height": viewport_height})
-                await page.emulate_media(media="screen")
+            # Create HTML with Mermaid
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <script src="https://unpkg.com/mermaid@10.6.1/dist/mermaid.min.js"></script>
+                <style>
+                    body {{
+                        margin: 0;
+                        padding: 10px;
+                        background: white;
+                        font-family: Arial, sans-serif;
+                    }}
+                    .mermaid {{
+                        text-align: center;
+                        background: white;
+                        display: inline-block;
+                        padding: 5px;
+                    }}
+                    .mermaid svg {{
+                        max-width: none;
+                        height: auto;
+                        display: block;
+                        font-family: Arial, sans-serif;
+                    }}
+                    .mermaid .node rect {{
+                        rx: 3;
+                        ry: 3;
+                    }}
+                    .mermaid .edgePath .path {{
+                        stroke-width: 1.5px;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="mermaid">
+                    {mermaid_code}
+                </div>
+                <script>
+                    // Load Mermaid configuration from file if available
+                    let mermaidConfig = {{
+                        startOnLoad: true,
+                        theme: 'default',
+                        themeVariables: {{
+                            primaryColor: '#ff6b6b',
+                            primaryTextColor: '#333',
+                            primaryBorderColor: '#ff6b6b',
+                            lineColor: '#333',
+                            secondaryColor: '#4ecdc4',
+                            tertiaryColor: '#45b7d1'
+                        }},
+                        flowchart: {{
+                            useMaxWidth: false,
+                            htmlLabels: true,
+                            curve: 'basis',
+                            nodeSpacing: 30,
+                            rankSpacing: 30,
+                            diagramMarginX: 10,
+                            diagramMarginY: 5
+                        }},
+                        sequence: {{
+                            useMaxWidth: false,
+                            diagramMarginY: 3,
+                            diagramMarginX: 10,
+                            messageFontSize: 12,
+                            actorFontSize: 12,
+                            actorMargin: 20,
+                            messageMargin: 10
+                        }},
+                        gantt: {{
+                            useMaxWidth: false
+                        }},
+                        graph: {{
+                            useMaxWidth: false,
+                            nodeSpacing: 30,
+                            rankSpacing: 30,
+                            diagramMarginX: 10,
+                            diagramMarginY: 5
+                        }}
+                    }};
+                    
+                    mermaid.initialize(mermaidConfig);
+                </script>
+            </body>
+            </html>
+            """
+            
+            await page.set_content(html_content)
+            
+            # Wait for Mermaid to render - use dynamic polling instead of fixed 3s wait
+            # Wait for Mermaid to render using dimension stability detection
+            max_wait_time = 5000  # 5 seconds max
+            poll_interval = 100  # 100ms polling
+            stability_checks = 3  # Number of consecutive stable checks required
+            elapsed_time = 0
+            
+            # First, wait for SVG to appear
+            svg_found = False
+            while elapsed_time < max_wait_time and not svg_found:
+                svg_element = await page.query_selector('.mermaid svg')
+                if svg_element:
+                    svg_content = await svg_element.inner_html()
+                    if svg_content and len(svg_content.strip()) > 0:
+                        self._log_debug(f"Mermaid SVG detected in {elapsed_time}ms")
+                        svg_found = True
+                        break
                 
-                # Create HTML with Mermaid
-                html_content = f"""
-                <!DOCTYPE html>
-                <html>
-                <head>
-                    <meta charset="utf-8">
-                    <script src="https://unpkg.com/mermaid@10.6.1/dist/mermaid.min.js"></script>
-                    <style>
-                        body {{
-                            margin: 0;
-                            padding: 10px;
-                            background: white;
-                            font-family: Arial, sans-serif;
-                        }}
-                        .mermaid {{
-                            text-align: center;
-                            background: white;
-                            display: inline-block;
-                            padding: 5px;
-                        }}
-                        .mermaid svg {{
-                            max-width: none;
-                            height: auto;
-                            display: block;
-                            font-family: Arial, sans-serif;
-                        }}
-                        .mermaid .node rect {{
-                            rx: 3;
-                            ry: 3;
-                        }}
-                        .mermaid .edgePath .path {{
-                            stroke-width: 1.5px;
-                        }}
-                    </style>
-                </head>
-                <body>
-                    <div class="mermaid">
-                        {mermaid_code}
-                    </div>
-                    <script>
-                        // Load Mermaid configuration from file if available
-                        let mermaidConfig = {{
-                            startOnLoad: true,
-                            theme: 'default',
-                            themeVariables: {{
-                                primaryColor: '#ff6b6b',
-                                primaryTextColor: '#333',
-                                primaryBorderColor: '#ff6b6b',
-                                lineColor: '#333',
-                                secondaryColor: '#4ecdc4',
-                                tertiaryColor: '#45b7d1'
-                            }},
-                            flowchart: {{
-                                useMaxWidth: false,
-                                htmlLabels: true,
-                                curve: 'basis',
-                                nodeSpacing: 30,
-                                rankSpacing: 30,
-                                diagramMarginX: 10,
-                                diagramMarginY: 5
-                            }},
-                            sequence: {{
-                                useMaxWidth: false,
-                                diagramMarginY: 3,
-                                diagramMarginX: 10,
-                                messageFontSize: 12,
-                                actorFontSize: 12,
-                                actorMargin: 20,
-                                messageMargin: 10
-                            }},
-                            gantt: {{
-                                useMaxWidth: false
-                            }},
-                            graph: {{
-                                useMaxWidth: false,
-                                nodeSpacing: 30,
-                                rankSpacing: 30,
-                                diagramMarginX: 10,
-                                diagramMarginY: 5
-                            }}
-                        }};
-                        
-                        mermaid.initialize(mermaidConfig);
-                    </script>
-                </body>
-                </html>
-                """
-                
-                await page.set_content(html_content)
-                
-                # Wait for Mermaid to render
-                await page.wait_for_timeout(3000)
-                
-                # Get the mermaid element and take screenshot of just that element
+                await page.wait_for_timeout(poll_interval)
+                elapsed_time += poll_interval
+            
+            if not svg_found:
+                self._log_warning(f"Mermaid SVG not found after {max_wait_time}ms")
+            else:
+                # Wait for dimensions to stabilize
                 mermaid_element = await page.query_selector('.mermaid')
                 if mermaid_element:
-                    # Get the bounding box of the mermaid element
-                    bounding_box = await mermaid_element.bounding_box()
-                    if bounding_box:
-                        # Take high-resolution screenshot of just the mermaid element
-                        await mermaid_element.screenshot(
-                            path=str(output_path), 
-                            type='png',
-                            scale='device'
-                        )
+                    stable_count = 0
+                    last_box = None
+                    stability_start = elapsed_time
+                    
+                    while elapsed_time < max_wait_time and stable_count < stability_checks:
+                        await page.wait_for_timeout(50)  # Short wait between checks
+                        current_box = await mermaid_element.bounding_box()
+                        
+                        if current_box and last_box:
+                            # Check if dimensions are stable (within 1px tolerance for floating point)
+                            width_stable = abs(current_box['width'] - last_box['width']) < 1
+                            height_stable = abs(current_box['height'] - last_box['height']) < 1
+                            
+                            if width_stable and height_stable:
+                                stable_count += 1
+                            else:
+                                stable_count = 0  # Reset if dimensions changed
+                        
+                        last_box = current_box
+                        elapsed_time += 50
+                    
+                    if stable_count >= stability_checks:
+                        self._log_debug(f"Mermaid diagram layout stabilized in {elapsed_time - stability_start}ms (total: {elapsed_time}ms)")
                     else:
-                        # Fallback to full page if bounding box not available
-                        await page.screenshot(
-                            path=str(output_path), 
-                            type='png', 
-                            full_page=True,
-                            scale='device'
-                        )
+                        self._log_warning(f"Mermaid diagram dimensions did not stabilize after {max_wait_time}ms")
+            
+            # Get the mermaid element and take screenshot of just that element
+            mermaid_element = await page.query_selector('.mermaid')
+            if mermaid_element:
+                # Get the bounding box of the mermaid element
+                bounding_box = await mermaid_element.bounding_box()
+                if bounding_box:
+                    # Take high-resolution screenshot of just the mermaid element
+                    await mermaid_element.screenshot(
+                        path=str(output_path), 
+                        type='png',
+                        scale='device'
+                    )
                 else:
-                    # Fallback to full page if mermaid element not found
+                    # Fallback to full page if bounding box not available
                     await page.screenshot(
                         path=str(output_path), 
                         type='png', 
                         full_page=True,
                         scale='device'
                     )
-                
-                await browser.close()
-                
-                return True, ""
+            else:
+                # Fallback to full page if mermaid element not found
+                await page.screenshot(
+                    path=str(output_path), 
+                    type='png', 
+                    full_page=True,
+                    scale='device'
+                )
+            
+            return True, ""
                 
         except Exception as e:
             error_msg = f"Failed to render Mermaid diagram: {e}"
@@ -520,11 +623,9 @@ class MarkdownToPDFConverter:
     def _render_plantuml_diagram(self, plantuml_code: str, output_path: Path) -> tuple[bool, str]:
         """Render PlantUML diagram to image using the plantuml library."""
         try:
-            # Create PlantUML instance with HTTPS server URL and PNG endpoint
-            puml = plantuml.PlantUML(url='https://www.plantuml.com/plantuml/png/')
-            
+            # Reuse PlantUML client instance for connection pooling
             # Render the diagram to PNG and get raw image data
-            image_data = puml.processes(plantuml_code)
+            image_data = self._plantuml_client.processes(plantuml_code)
             
             # Write the image data to file
             with open(output_path, 'wb') as f:
@@ -611,41 +712,36 @@ class MarkdownToPDFConverter:
                 modifier_info = f" ({scale_type}:{custom_scale})"
             self._log_debug(f"Rendering Mermaid diagram {i} to: {image_path}{modifier_info}")
             
-            # Run async function in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                success, error_msg = loop.run_until_complete(
-                    self._render_mermaid_diagram(mermaid_code, image_path)
-                )
-                if success:
-                    # Resize the rendered image based on modifiers
-                    if skip_resize:
-                        self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
-                    elif custom_scale:
-                        action = "upscaling" if scale_type == "upscale" else "downscaling"
-                        self._log_debug(f"Applying custom {action} {custom_scale} to Mermaid diagram {i}")
-                        self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
-                    else:
-                        # Use default resize settings
-                        self._resize_image(image_path)
-                    
-                    self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
-                    # Replace the code block with image reference
-                    content = content.replace(
-                        full_block,
-                        f"![]({image_path})"
-                    )
+            # Reuse event loop from file processing (thread-safe)
+            success, error_msg = self._thread_local.event_loop.run_until_complete(
+                self._render_mermaid_diagram(mermaid_code, image_path)
+            )
+            if success:
+                # Resize the rendered image based on modifiers
+                if skip_resize:
+                    self._log_debug(f"Skipping resize for Mermaid diagram {i} due to no-resize modifier")
+                elif custom_scale:
+                    action = "upscaling" if scale_type == "upscale" else "downscaling"
+                    self._log_debug(f"Applying custom {action} {custom_scale} to Mermaid diagram {i}")
+                    self._resize_image(image_path, max_width=custom_scale, max_height=custom_scale)
                 else:
-                    self._log_error(f"Failed to render Mermaid diagram {i}")
-                    # Insert error placeholder with actual error message
-                    error_placeholder = self._create_diagram_error_placeholder("Mermaid", i, mermaid_code, error_msg)
-                    content = content.replace(
-                        full_block,
-                        error_placeholder
-                    )
-            finally:
-                loop.close()
+                    # Use default resize settings
+                    self._resize_image(image_path)
+                
+                self._log_debug(f"Mermaid diagram rendered successfully, using path: {image_path}")
+                # Replace the code block with image reference
+                content = content.replace(
+                    full_block,
+                    f"![]({image_path})"
+                )
+            else:
+                self._log_error(f"Failed to render Mermaid diagram {i}")
+                # Insert error placeholder with actual error message
+                error_placeholder = self._create_diagram_error_placeholder("Mermaid", i, mermaid_code, error_msg)
+                content = content.replace(
+                    full_block,
+                    error_placeholder
+                )
         
         return content
     
@@ -1246,45 +1342,44 @@ class MarkdownToPDFConverter:
     async def _convert_html_to_pdf(self, html_file: Path, output_pdf: Path, margins: Dict[str, str]) -> bool:
         """Convert HTML to PDF using Playwright (Puppeteer approach)."""
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
-                
-                # Load HTML file
-                await page.goto(html_file.absolute().as_uri())
-                
-                # Wait for content to load
-                await page.wait_for_load_state('networkidle')
-                
-                # Convert margins to cm for PDF generation
-                top_cm = self._convert_margin_to_cm(margins['top'])
-                right_cm = self._convert_margin_to_cm(margins['right'])
-                bottom_cm = self._convert_margin_to_cm(margins['bottom'])
-                left_cm = self._convert_margin_to_cm(margins['left'])
-                
-                # Generate PDF with precise A4 settings
-                await page.pdf(
-                    path=str(output_pdf),
-                    format='A4',
-                    width='210mm',
-                    height='297mm',
-                    margin={
-                        'top': f'{top_cm}cm',
-                        'right': f'{right_cm}cm',
-                        'bottom': f'{bottom_cm}cm',
-                        'left': f'{left_cm}cm'
-                    },
-                    print_background=True,
-                    prefer_css_page_size=True,
-                    display_header_footer=True,
-                    header_template='<div></div>',
-                    footer_template='<div style="font-size: 10px; text-align: center; width: 100%; margin: 0 auto;"><span class="pageNumber"></span></div>',
-                    scale=1.0
-                )
-                
-                await browser.close()
-                return True
-                
+            # Reuse browser instance (thread-safe)
+            await self._ensure_browser()
+            page = self._thread_local.page
+            
+            # Load HTML file
+            await page.goto(html_file.absolute().as_uri())
+            
+            # Wait for content to load
+            await page.wait_for_load_state('networkidle')
+            
+            # Convert margins to cm for PDF generation
+            top_cm = self._convert_margin_to_cm(margins['top'])
+            right_cm = self._convert_margin_to_cm(margins['right'])
+            bottom_cm = self._convert_margin_to_cm(margins['bottom'])
+            left_cm = self._convert_margin_to_cm(margins['left'])
+            
+            # Generate PDF with precise A4 settings
+            await page.pdf(
+                path=str(output_pdf),
+                format='A4',
+                width='210mm',
+                height='297mm',
+                margin={
+                    'top': f'{top_cm}cm',
+                    'right': f'{right_cm}cm',
+                    'bottom': f'{bottom_cm}cm',
+                    'left': f'{left_cm}cm'
+                },
+                print_background=True,
+                prefer_css_page_size=True,
+                display_header_footer=True,
+                header_template='<div></div>',
+                footer_template='<div style="font-size: 10px; text-align: center; width: 100%; margin: 0 auto;"><span class="pageNumber"></span></div>',
+                scale=1.0
+            )
+            
+            return True
+            
         except Exception as e:
             self._log_error(f"Failed to convert HTML to PDF: {e}")
             return False
@@ -1295,18 +1390,27 @@ class MarkdownToPDFConverter:
             filename = md_file.name
             output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
             
-            # Check if conversion is needed before processing
-            current_markdown_hash = calculate_file_hash(md_file)
+            # Check if conversion is needed before processing (unless force_regenerate is True)
+            if not self.force_regenerate:
+                current_markdown_hash = calculate_file_hash(md_file)
+                
+                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
+                                                            self.diagram_width, self.diagram_height, self.page_margins, True):
+                    self._log_info(f"Skipping {filename} - PDF is up to date")
+                    return True, filename  # Success but skipped
             
-            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
-                                                        self.diagram_width, self.diagram_height, self.page_margins, True):
-                self._log_info(f"Skipping {filename} - PDF is up to date")
-                return True, filename  # Success but skipped
-            
-            if self._convert_md_to_pdf(md_file, output_pdf):
-                return True, filename
-            else:
-                return False, filename
+            try:
+                if self._convert_md_to_pdf(md_file, output_pdf):
+                    return True, filename
+                else:
+                    return False, filename
+            finally:
+                # Clean up browser and event loop resources after processing file (thread-safe)
+                tls = self._thread_local
+                if hasattr(tls, 'event_loop') and tls.event_loop:
+                    tls.event_loop.run_until_complete(self._close_browser())
+                    tls.event_loop.close()
+                    tls.event_loop = None
                 
         except Exception as e:
             self._log_error(f"Error processing {md_file.name}: {e}")
@@ -1315,6 +1419,12 @@ class MarkdownToPDFConverter:
     def _convert_md_to_pdf(self, md_file: Path, output_pdf: Path) -> bool:
         """Convert markdown file to PDF."""
         try:
+            # Create event loop once for entire file processing (reuse optimization, thread-safe)
+            tls = self._thread_local
+            if not hasattr(tls, 'event_loop') or tls.event_loop is None or tls.event_loop.is_closed():
+                tls.event_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(tls.event_loop)
+            
             # Calculate current markdown hash for saving state
             current_markdown_hash = calculate_file_hash(md_file)
             filename = md_file.name
@@ -1385,27 +1495,22 @@ class MarkdownToPDFConverter:
             # Convert HTML to PDF using Playwright
             self._log_debug(f"Converting HTML to PDF with margins: {margins}")
             
-            # Run async function in sync context
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                success = loop.run_until_complete(
-                    self._convert_html_to_pdf(enhanced_html_file, output_pdf, margins)
+            # Reuse the event loop created at the start (thread-safe)
+            success = tls.event_loop.run_until_complete(
+                self._convert_html_to_pdf(enhanced_html_file, output_pdf, margins)
+            )
+            if success:
+                # Calculate PDF hash and save document state
+                pdf_hash = calculate_file_hash(output_pdf)
+                self.state_manager.save_document_state(
+                    filename, current_markdown_hash, pdf_hash, self.style_profile,
+                    self.diagram_width, self.diagram_height, self.page_margins, True
                 )
-                if success:
-                    # Calculate PDF hash and save document state
-                    pdf_hash = calculate_file_hash(output_pdf)
-                    self.state_manager.save_document_state(
-                        filename, current_markdown_hash, pdf_hash, self.style_profile,
-                        self.diagram_width, self.diagram_height, self.page_margins, True
-                    )
-                    self._log_success(f"Converted {md_file.name} to {output_pdf.name}")
-                    return True
-                else:
-                    self._log_error(f"Failed to convert {md_file.name}")
-                    return False
-            finally:
-                loop.close()
+                self._log_success(f"Converted {md_file.name} to {output_pdf.name}")
+                return True
+            else:
+                self._log_error(f"Failed to convert {md_file.name}")
+                return False
                 
         except Exception as e:
             self._log_error(f"Error converting {md_file.name}: {e}")
@@ -1450,14 +1555,18 @@ class MarkdownToPDFConverter:
                 try:
                     success, filename = future.result()
                     if success:
-                        # Check if it was actually converted or just skipped
-                        current_markdown_hash = calculate_file_hash(md_file)
-                        output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
-                        
-                        if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
-                                                                     self.diagram_width, self.diagram_height, self.page_margins, True):
-                            skipped_count += 1
+                        # Check if it was actually converted or just skipped (unless force_regenerate is True)
+                        if not self.force_regenerate:
+                            current_markdown_hash = calculate_file_hash(md_file)
+                            output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
+                            
+                            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_pdf, self.style_profile,
+                                                                         self.diagram_width, self.diagram_height, self.page_margins, True):
+                                skipped_count += 1
+                            else:
+                                success_count += 1
                         else:
+                            # Force regenerate means all files are converted
                             success_count += 1
                     else:
                         failed_count += 1
@@ -1481,16 +1590,20 @@ class MarkdownToPDFConverter:
         for md_file in md_files:
             success, filename = self._convert_single_file(md_file)
             if success:
-                # Check if it was actually converted or just skipped
-                current_markdown_hash = calculate_file_hash(md_file)
-                output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
-                
-                if not self.state_manager.needs_regeneration(
-                    filename, current_markdown_hash, output_pdf, self.style_profile,
-                    self.diagram_width, self.diagram_height, self.page_margins, True
-                ):
-                    skipped_count += 1
+                # Check if it was actually converted or just skipped (unless force_regenerate is True)
+                if not self.force_regenerate:
+                    current_markdown_hash = calculate_file_hash(md_file)
+                    output_pdf = self.pdf_dir / f"{md_file.stem}.pdf"
+                    
+                    if not self.state_manager.needs_regeneration(
+                        filename, current_markdown_hash, output_pdf, self.style_profile,
+                        self.diagram_width, self.diagram_height, self.page_margins, True
+                    ):
+                        skipped_count += 1
+                    else:
+                        success_count += 1
                 else:
+                    # Force regenerate means all files are converted
                     success_count += 1
         
         total_processed = success_count + skipped_count
@@ -1520,6 +1633,7 @@ def main():
     parser.add_argument("--no-parallel", action="store_true", help="Disable parallel processing and use sequential conversion")
     parser.add_argument("--max-diagram-width", type=str, default=None, help="Maximum diagram width: pixels (e.g., 1680, only if rendered exceeds) or percentage of rendered size (e.g., 80%%, max 100%%). Default: 1680")
     parser.add_argument("--max-diagram-height", type=str, default=None, help="Maximum diagram height: pixels (e.g., 2240, only if rendered exceeds) or percentage of rendered size (e.g., 80%%, max 100%%). Default: 2240")
+    parser.add_argument("--force", action="store_true", help="Force regeneration of all files, bypassing document verification")
     
     args = parser.parse_args()
     
@@ -1574,7 +1688,8 @@ def main():
         style_profile=args.profile,
         max_workers=args.max_workers,
         max_diagram_width=config.get_max_diagram_width(),
-        max_diagram_height=config.get_max_diagram_height()
+        max_diagram_height=config.get_max_diagram_height(),
+        force_regenerate=args.force
     )
     converter.convert_all(cleanup=not args.no_cleanup, parallel=not args.no_parallel)
 
