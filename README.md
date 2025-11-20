@@ -24,6 +24,7 @@ poetry run md2pdf --source ./docs
 - **Python 3.8+**
 - **Pandoc**: https://pandoc.org/installing.html
 - **Calibre** (optional, for MOBI): https://calibre-ebook.com/download
+- **PlantUML** (optional, for local diagram rendering): See [Local PlantUML Setup](#local-plantuml-setup-optional)
 
 ## Installation
 
@@ -121,6 +122,7 @@ export MD2PDF_SOURCE_DIR="./docs"
 export MD2PDF_OUTPUT_DIR="./output"
 export MD2PDF_MAX_DIAGRAM_WIDTH="1680"
 export MD2PDF_MAX_DIAGRAM_HEIGHT="2240"
+export MD2PDF_PLANTUML_SERVER="https://www.plantuml.com/plantuml/png/"  # Or local: http://localhost:8080/plantuml/png/
 ```
 
 **Config File:** `~/.config/markdown-to-pdf/config.json` (Linux/Mac) or `%APPDATA%/markdown-to-pdf/config.json` (Windows)
@@ -149,7 +151,8 @@ export MD2PDF_MAX_DIAGRAM_HEIGHT="80%"
 # Via config file: ~/.config/markdown-to-pdf/config.json
 {
   "max_diagram_width": "80%",
-  "max_diagram_height": "80%"
+  "max_diagram_height": "80%",
+  "plantuml_server": "https://www.plantuml.com/plantuml/png/"
 }
 ```
 
@@ -206,6 +209,68 @@ A -> B
 - `<!-- no-resize -->` - Keep original rendered size (skip all resizing)
 - `<!-- upscale:X% -->` - Scale up to X% of original (X > 100, e.g., `150%` = 1.5x larger, `200%` = 2x larger)
 - `<!-- downscale:X% -->` - Scale down to X% of original (0 < X < 100, e.g., `67%` = 67% of original, `50%` = half size)
+
+## Local PlantUML Setup (Optional)
+
+By default, PlantUML diagrams are rendered using the public PlantUML server (`https://www.plantuml.com`). For **privacy, security, or offline use**, you can set up a local PlantUML server.
+
+
+### Quick Setup with Docker (Recommended)
+
+```bash
+# Start local PlantUML server
+docker run -d -p 8080:8080 --name plantuml-server plantuml/plantuml-server:jetty
+
+# Configure to use local server
+export MD2PDF_PLANTUML_SERVER="http://localhost:8080/plantuml/png/"
+
+# Or via config file: ~/.config/markdown-to-pdf/config.json
+echo '{"plantuml_server": "http://localhost:8080/plantuml/png/"}' > ~/.config/markdown-to-pdf/config.json
+
+# Test it
+poetry run md2pdf --source ./docs
+```
+
+### Alternative: Java + PlantUML JAR
+
+If you prefer not using Docker:
+
+```bash
+# Install Java (if not already installed)
+# Ubuntu/Debian
+sudo apt update && sudo apt install default-jre
+
+# macOS (using Homebrew)
+brew install openjdk
+
+# Windows: Download from https://www.java.com/
+
+# Download PlantUML JAR
+curl -L https://github.com/plantuml/plantuml/releases/download/v1.2024.7/plantuml-1.2024.7.jar -o plantuml.jar
+
+# Start PlantUML's built-in PicoWeb server
+java -jar plantuml.jar -picoweb:8080
+
+# Configure as above
+export MD2PDF_PLANTUML_SERVER="http://localhost:8080/plantuml/png/"
+```
+
+### Configuration Options
+
+**Priority**: CLI args > Environment variables > Config file > Default
+
+```bash
+# Via environment variable
+export MD2PDF_PLANTUML_SERVER="http://localhost:8080/plantuml/png/"
+
+# Via config file: ~/.config/markdown-to-pdf/config.json (Linux/Mac)
+# or %APPDATA%/markdown-to-pdf/config.json (Windows)
+{
+  "plantuml_server": "http://localhost:8080/plantuml/png/"
+}
+```
+
+**Note**: Mermaid diagrams are always rendered locally using Playwright/Chromium and never make external requests.
 
 ## Troubleshooting
 

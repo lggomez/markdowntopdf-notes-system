@@ -72,7 +72,12 @@ class MarkdownToPDFConverter:
         self._thread_local = threading.local()
         
         # Performance optimization: reuse PlantUML client for connection pooling
-        self._plantuml_client = plantuml.PlantUML(url='https://www.plantuml.com/plantuml/png/')
+        # Get PlantUML server URL from config (supports local or external server)
+        from .config import Config
+        config = Config()
+        plantuml_server = config.get_plantuml_server()
+        self._plantuml_client = plantuml.PlantUML(url=plantuml_server)
+        self._log_debug(f"Using PlantUML server: {plantuml_server}")
         
         # Create format-specific output directory
         self.pdf_dir = self.output_dir / "pdf"

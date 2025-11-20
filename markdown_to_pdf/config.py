@@ -95,6 +95,7 @@ def get_config_from_env() -> Dict[str, Any]:
         "MD2PDF_DB_PATH": "db_path",
         "MD2PDF_MAX_DIAGRAM_WIDTH": "max_diagram_width",
         "MD2PDF_MAX_DIAGRAM_HEIGHT": "max_diagram_height",
+        "MD2PDF_PLANTUML_SERVER": "plantuml_server",
     }
     
     for env_var, config_key in env_mapping.items():
@@ -147,6 +148,7 @@ class Config:
             "db_path": str(get_default_db_path()),
             "max_diagram_width": 1680,
             "max_diagram_height": 2240,
+            "plantuml_server": "https://www.plantuml.com/plantuml/png/",  # Use local: http://localhost:8080/plantuml/png/
         }
     
     def get(self, key: str, default: Any = None) -> Any:
@@ -176,6 +178,10 @@ class Config:
     def get_max_diagram_height(self):
         """Get maximum diagram height (can be int pixels or str percentage)."""
         return self._config.get("max_diagram_height", 2240)
+    
+    def get_plantuml_server(self) -> str:
+        """Get PlantUML server URL."""
+        return self._config.get("plantuml_server", "https://www.plantuml.com/plantuml/png/")
     
     def update(self, updates: Dict[str, Any]) -> None:
         """Update configuration with new values."""
