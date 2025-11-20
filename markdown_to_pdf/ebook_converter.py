@@ -24,6 +24,7 @@ from .config import Config
 from .dependencies import check_dependencies
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from tqdm import tqdm
 
 # Initialize colorama for cross-platform colored output
 init(autoreset=True)
@@ -700,7 +701,7 @@ class MarkdownToEbookConverter:
             self._log_error(error_msg)
             return False, error_msg
     
-    def _replace_mermaid_with_images(self, content: str, file_id: str = "") -> str:
+    def _replace_mermaid_with_images(self, content: str, file_id: str = "", filename: str = "") -> str:
         """Replace Mermaid code blocks with image references.
         
         Supports HTML comment modifiers on line above diagram:
@@ -726,7 +727,12 @@ class MarkdownToEbookConverter:
         # Find all matches with their modifiers
         matches = list(re.finditer(mermaid_pattern, content, re.DOTALL | re.IGNORECASE))
         
-        for i, match in enumerate(matches):
+        if not matches:
+            return content
+        
+        # Process with progress bar
+        desc = f"  {filename} - Mermaid" if filename else "  Mermaid diagrams"
+        for i, match in enumerate(tqdm(matches, desc=desc, unit="diagram", leave=False)):
             no_resize_modifier = match.group(1)  # "no-resize" or None
             upscale_percent = match.group(2)  # percentage digits for upscale or None
             downscale_percent = match.group(3)  # percentage digits for downscale or None
@@ -794,7 +800,7 @@ class MarkdownToEbookConverter:
         
         return content
     
-    def _replace_plantuml_with_images(self, content: str, file_id: str = "") -> str:
+    def _replace_plantuml_with_images(self, content: str, file_id: str = "", filename: str = "") -> str:
         """Replace PlantUML code blocks with image references.
         
         Supports HTML comment modifiers on line above diagram:
@@ -822,7 +828,12 @@ class MarkdownToEbookConverter:
         # Find all matches with their modifiers
         matches = list(re.finditer(plantuml_pattern, content, re.DOTALL | re.IGNORECASE))
         
-        for i, match in enumerate(matches):
+        if not matches:
+            return content
+        
+        # Process with progress bar
+        desc = f"  {filename} - PlantUML" if filename else "  PlantUML diagrams"
+        for i, match in enumerate(tqdm(matches, desc=desc, unit="diagram", leave=False)):
             no_resize_modifier = match.group(1)  # "no-resize" or None
             upscale_percent = match.group(2)  # percentage digits for upscale or None
             downscale_percent = match.group(3)  # percentage digits for downscale or None
@@ -1396,52 +1407,65 @@ class MarkdownToEbookConverter:
     def _convert_to_epub(self, md_file: Path, output_epub: Path, title: str) -> bool:
         """Convert markdown to EPUB format using Pandoc."""
         try:
-            # Create temporary markdown file
-            temp_md = self.temp_dir / f"temp_{md_file.name}"
+            filename = md_file.name
             
-            # Read and process markdown content
-            with open(md_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # Process content (same as PDF processing)
-            processed_content = self._filter_sections_for_print(content)
-            file_id = md_file.stem
-            processed_content = self._replace_mermaid_with_images(processed_content, file_id)
-            processed_content = self._replace_plantuml_with_images(processed_content, file_id)
-            processed_content = self._process_page_breaks(processed_content)
-            processed_content = self._process_and_embed_images(processed_content, md_file)
-            
-            # Write processed content to temp file
-            with open(temp_md, 'w', encoding='utf-8') as f:
-                f.write(processed_content)
-            
-            # Create device-specific CSS if needed
-            css_file = None
-            if self.style_profile == "kindle-paperwhite-11":
-                css_file = self._create_paperwhite_css()
-            
-            # Convert to EPUB using Pandoc
-            cmd = [
-                "pandoc",
-                str(temp_md),
-                "-o", str(output_epub),
-                "--standalone",
-                "--self-contained",
-                f"--metadata=title:{title}",
-                f"--metadata=author:{self.author}",
-                f"--metadata=language:{self.language}",
-                "--toc",
-                "--toc-depth=3"
-            ]
-            
-            # Add CSS file if created
-            if css_file:
-                cmd.extend(["--css", str(css_file)])
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                self._log_error(f"Pandoc EPUB conversion failed: {result.stderr}")
-                return False
+            # Create progress bar for EPUB conversion steps
+            with tqdm(total=5, desc=f"  {filename}", unit="step", leave=False) as pbar:
+                # Step 1: Read markdown content
+                pbar.set_description(f"  {filename} - Reading")
+                with open(md_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                pbar.update(1)
+                
+                # Step 2: Process content
+                pbar.set_description(f"  {filename} - Processing")
+                processed_content = self._filter_sections_for_print(content)
+                file_id = md_file.stem
+                pbar.update(1)
+                
+                # Step 3: Process diagrams
+                pbar.set_description(f"  {filename} - Diagrams")
+                processed_content = self._replace_mermaid_with_images(processed_content, file_id, filename)
+                processed_content = self._replace_plantuml_with_images(processed_content, file_id, filename)
+                pbar.update(1)
+                
+                # Step 4: Process page breaks and images
+                pbar.set_description(f"  {filename} - Images")
+                processed_content = self._process_page_breaks(processed_content)
+                processed_content = self._process_and_embed_images(processed_content, md_file)
+                
+                temp_md = self.temp_dir / f"temp_{md_file.name}"
+                with open(temp_md, 'w', encoding='utf-8') as f:
+                    f.write(processed_content)
+                pbar.update(1)
+                
+                # Step 5: Convert to EPUB
+                pbar.set_description(f"  {filename} - EPUB")
+                css_file = None
+                if self.style_profile == "kindle-paperwhite-11":
+                    css_file = self._create_paperwhite_css()
+                
+                cmd = [
+                    "pandoc",
+                    str(temp_md),
+                    "-o", str(output_epub),
+                    "--standalone",
+                    "--self-contained",
+                    f"--metadata=title:{title}",
+                    f"--metadata=author:{self.author}",
+                    f"--metadata=language:{self.language}",
+                    "--toc",
+                    "--toc-depth=3"
+                ]
+                
+                if css_file:
+                    cmd.extend(["--css", str(css_file)])
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    self._log_error(f"Pandoc EPUB conversion failed: {result.stderr}")
+                    return False
+                pbar.update(1)
             
             return True
             
@@ -1759,62 +1783,79 @@ a { color: #0066cc; text-decoration: none; }
     def _convert_to_pdf(self, md_file: Path, output_pdf: Path, title: str) -> bool:
         """Convert markdown to PDF (reuse existing logic)."""
         try:
-            # Read markdown content
-            with open(md_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+            # Get thread-local storage for event loop
+            tls = self._thread_local
             
-            # Process content
-            processed_content = self._filter_sections_for_print(content)
-            file_id = md_file.stem
-            processed_content = self._replace_mermaid_with_images(processed_content, file_id)
-            processed_content = self._replace_plantuml_with_images(processed_content, file_id)
-            processed_content = self._process_page_breaks(processed_content)
-            processed_content = self._process_and_embed_images(processed_content, md_file)
+            # Calculate hashes for state management
+            current_markdown_hash = calculate_file_hash(md_file)
+            filename = md_file.name
             
-            # Convert markdown to HTML using pandoc
-            temp_md = self.temp_dir / f"temp_{md_file.name}"
-            with open(temp_md, 'w', encoding='utf-8') as f:
-                f.write(processed_content)
+            # Create progress bar for this file's conversion steps
+            with tqdm(total=6, desc=f"  {filename}", unit="step", leave=False) as pbar:
+                # Step 1: Read markdown content
+                pbar.set_description(f"  {filename} - Reading")
+                with open(md_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                pbar.update(1)
+                
+                # Step 2: Process content
+                pbar.set_description(f"  {filename} - Processing")
+                processed_content = self._filter_sections_for_print(content)
+                file_id = md_file.stem
+                pbar.update(1)
+                
+                # Step 3: Process diagrams
+                pbar.set_description(f"  {filename} - Diagrams")
+                processed_content = self._replace_mermaid_with_images(processed_content, file_id, filename)
+                processed_content = self._replace_plantuml_with_images(processed_content, file_id, filename)
+                pbar.update(1)
+                
+                # Step 4: Process page breaks and images
+                pbar.set_description(f"  {filename} - Images")
+                processed_content = self._process_page_breaks(processed_content)
+                processed_content = self._process_and_embed_images(processed_content, md_file)
+                pbar.update(1)
+                
+                # Step 5: Convert to HTML
+                pbar.set_description(f"  {filename} - HTML")
+                temp_md = self.temp_dir / f"temp_{md_file.name}"
+                with open(temp_md, 'w', encoding='utf-8') as f:
+                    f.write(processed_content)
+                
+                html_file = self.temp_dir / f"{md_file.stem}.html"
+                cmd = [
+                    "pandoc",
+                    str(temp_md),
+                    "-o", str(html_file),
+                    "--standalone",
+                    "--self-contained",
+                    "--css", "data:text/css,",
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    self._log_error(f"Pandoc failed: {result.stderr}")
+                    return False
+                
+                with open(html_file, 'r', encoding='utf-8') as f:
+                    html_content = f.read()
+                
+                margins = self._parse_margins()
+                enhanced_html = self._create_html_template(html_content, margins, title)
+                enhanced_html_file = self.temp_dir / f"enhanced_{md_file.stem}.html"
+                with open(enhanced_html_file, 'w', encoding='utf-8') as f:
+                    f.write(enhanced_html)
+                pbar.update(1)
+                
+                # Step 6: Convert to PDF
+                pbar.set_description(f"  {filename} - PDF")
+                self._log_debug(f"Converting HTML to PDF with margins: {margins}")
+                success = tls.event_loop.run_until_complete(
+                    self._convert_html_to_pdf(enhanced_html_file, output_pdf, margins)
+                )
+                pbar.update(1)
             
-            html_file = self.temp_dir / f"{md_file.stem}.html"
-            cmd = [
-                "pandoc",
-                str(temp_md),
-                "-o", str(html_file),
-                "--standalone",
-                "--self-contained",
-                "--css", "data:text/css,",  # Empty CSS, we'll add our own
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                self._log_error(f"Pandoc failed: {result.stderr}")
-                return False
-            
-            # Read the generated HTML
-            with open(html_file, 'r', encoding='utf-8') as f:
-                html_content = f.read()
-            
-            # Parse margins
-            margins = self._parse_margins()
-            
-            # Create enhanced HTML template
-            enhanced_html = self._create_html_template(html_content, margins, title)
-            
-            # Write enhanced HTML
-            enhanced_html_file = self.temp_dir / f"enhanced_{md_file.stem}.html"
-            with open(enhanced_html_file, 'w', encoding='utf-8') as f:
-                f.write(enhanced_html)
-            
-            # Convert HTML to PDF using Playwright
-            self._log_debug(f"Converting HTML to PDF with margins: {margins}")
-            
-            # Reuse the event loop created at the start (thread-safe)
-            success = tls.event_loop.run_until_complete(
-                self._convert_html_to_pdf(enhanced_html_file, output_pdf, margins)
-            )
             if success:
-                # Calculate PDF hash and save document state
                 pdf_hash = calculate_file_hash(output_pdf)
                 self.state_manager.save_document_state(
                     filename, current_markdown_hash, pdf_hash, self.style_profile,
@@ -1833,15 +1874,23 @@ a { color: #0066cc; text-decoration: none; }
     def _convert_to_mobi(self, md_file: Path, output_mobi: Path, title: str) -> bool:
         """Convert markdown to MOBI format."""
         try:
-            # First convert to EPUB
-            epub_file = self.temp_dir / f"{md_file.stem}.epub"
+            filename = md_file.name
             
-            if not self._convert_to_epub(md_file, epub_file, title):
-                return False
-            
-            # Then convert EPUB to MOBI
-            if not self._convert_epub_to_mobi(epub_file, output_mobi):
-                return False
+            # Create progress bar for MOBI conversion (EPUB + Calibre conversion)
+            with tqdm(total=2, desc=f"  {filename}", unit="step", leave=False) as pbar:
+                # Step 1: Convert to EPUB first
+                pbar.set_description(f"  {filename} - EPUB")
+                epub_file = self.temp_dir / f"{md_file.stem}.epub"
+                
+                if not self._convert_to_epub(md_file, epub_file, title):
+                    return False
+                pbar.update(1)
+                
+                # Step 2: Convert EPUB to MOBI
+                pbar.set_description(f"  {filename} - MOBI")
+                if not self._convert_epub_to_mobi(epub_file, output_mobi):
+                    return False
+                pbar.update(1)
             
             # Save document state
             current_markdown_hash = calculate_file_hash(md_file)
@@ -1871,7 +1920,7 @@ a { color: #0066cc; text-decoration: none; }
         
         self._log_info(f"Starting markdown to {self.output_format.upper()} conversion...")
         self._log_info(f"Source directory: {self.source_dir.absolute()}")
-        self._log_info(f"Output directory: {self.format_dir.absolute()}")
+        self._log_info(f"Output directory: {self.format_output_dir.absolute()}")
         self._log_info(f"Found {len(md_files)} markdown files: {[f.name for f in md_files]}")
         
         if parallel and len(md_files) > 1:
@@ -1891,30 +1940,38 @@ a { color: #0066cc; text-decoration: none; }
             # Submit all tasks
             future_to_file = {executor.submit(self._convert_single_file, md_file): md_file for md_file in md_files}
             
-            # Process completed tasks
-            for future in as_completed(future_to_file):
-                md_file = future_to_file[future]
-                try:
-                    success, filename = future.result()
-                    if success:
-                        # Check if it was actually converted or just skipped (unless force_regenerate is True)
-                        if not self.force_regenerate:
-                            current_markdown_hash = calculate_file_hash(md_file)
-                            output_file = self.format_output_dir / f"{md_file.stem}.{self.output_format}"
-                            
-                            if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_file, self.style_profile,
-                                                                         self.diagram_width, self.diagram_height, None, False):
-                                skipped_count += 1
+            # Process completed tasks with progress bar
+            with tqdm(total=len(md_files), desc="Converting files", unit="file") as pbar:
+                for future in as_completed(future_to_file):
+                    md_file = future_to_file[future]
+                    try:
+                        success, filename = future.result()
+                        if success:
+                            # Check if it was actually converted or just skipped (unless force_regenerate is True)
+                            if not self.force_regenerate:
+                                current_markdown_hash = calculate_file_hash(md_file)
+                                output_file = self.format_output_dir / f"{md_file.stem}.{self.output_format}"
+                                
+                                if not self.state_manager.needs_regeneration(filename, current_markdown_hash, output_file, self.style_profile,
+                                                                             self.diagram_width, self.diagram_height, None, False):
+                                    skipped_count += 1
+                                    pbar.set_postfix_str(f"Skipped: {filename}")
+                                else:
+                                    success_count += 1
+                                    pbar.set_postfix_str(f"Converted: {filename}")
                             else:
+                                # Force regenerate means all files are converted
                                 success_count += 1
+                                pbar.set_postfix_str(f"Converted: {filename}")
                         else:
-                            # Force regenerate means all files are converted
-                            success_count += 1
-                    else:
+                            failed_count += 1
+                            pbar.set_postfix_str(f"Failed: {filename}")
+                    except Exception as e:
+                        self._log_error(f"Exception in parallel processing for {md_file.name}: {e}")
                         failed_count += 1
-                except Exception as e:
-                    self._log_error(f"Exception in parallel processing for {md_file.name}: {e}")
-                    failed_count += 1
+                        pbar.set_postfix_str(f"Failed: {md_file.name}")
+                    finally:
+                        pbar.update(1)
         
         total_processed = success_count + skipped_count + failed_count
         self._log_success(f"Parallel conversion complete: {success_count} files converted, {skipped_count} files skipped, {failed_count} files failed ({total_processed}/{len(md_files)} total)")
@@ -1929,7 +1986,8 @@ a { color: #0066cc; text-decoration: none; }
         success_count = 0
         skipped_count = 0
         
-        for md_file in md_files:
+        # Use progress bar for sequential conversion
+        for md_file in tqdm(md_files, desc="Converting files", unit="file"):
             success, filename = self._convert_single_file(md_file)
             if success:
                 # Check if it was actually converted or just skipped (unless force_regenerate is True)
