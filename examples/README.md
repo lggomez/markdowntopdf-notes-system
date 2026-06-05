@@ -1,0 +1,1 @@
+This is a small compilation of exapmles with more real-world oriented examples. Do not take their contents too seriously, these were generated via LLMs
